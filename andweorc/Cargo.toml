@@ -1,0 +1,20 @@
+[package]
+name = "andweorc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+nix = { version = "0.23", default_features = false }
+spin = { version = "0.9", default_features = false, features = ["once"] }
+libc = { version = "0.2", default_features = false }
+libc-print = { version = "0.1", default_features = false }
+dashmap = { version = "5.0", default_features = false }
+signal-hook = { version = "0.3", default_features = false }
+rand = { version = "0.8", default_features = false, features = ["small_rng"] }
+# procmaps = "0.4"
+# addr2line = { version = "0.17", default_features = false }
+# memmap = "0.7"
+perf-event = { git = "https://github.com/blt/perf-event", branch = "bobbobbio_smash", default_features = false }
