@@ -1,26 +1,38 @@
 #!/usr/bin/env bash
-# Run Kani formal verification
+set -o errexit
+set -o nounset
+set -o pipefail
 
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-
-cd "$ROOT_DIR"
-
-CRATE="${1:-}"
-
-if [[ -z "$CRATE" ]]; then
+# Check if a crate argument was provided
+if [ $# -eq 0 ]; then
     echo "Usage: $0 <crate>"
-    echo "Example: $0 andweorc"
+    echo "Valid crates: andweorc"
     exit 1
 fi
 
+CRATE="$1"
+
+# Validate the crate argument
+case "$CRATE" in
+    andweorc)
+        # Valid crate
+        ;;
+    *)
+        echo "Error: Invalid crate '$CRATE'"
+        echo "Valid crates: andweorc"
+        exit 1
+        ;;
+esac
+
+# Check if kani is installed
 if ! command -v cargo-kani &> /dev/null; then
-    echo "cargo-kani not installed"
-    echo "Install from: https://model-checking.github.io/kani/"
-    exit 1
+    echo "kani-verifier is not installed. Installing it now..."
+    cargo install kani-verifier
 fi
 
-echo "Running Kani proofs for $CRATE..."
-cargo kani --package "$CRATE" --solver cadical
+echo "Running kani proofs for $CRATE..."
+
+# Run kani on the specified crate
+(cd "$CRATE" && cargo kani --solver cadical)
+
+echo "Kani proofs passed for $CRATE!"

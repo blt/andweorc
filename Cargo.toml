@@ -28,6 +28,9 @@ large_stack_arrays = "deny"
 # Numeric correctness
 float_cmp = "deny"
 
+# Performance
+manual_memcpy = "deny"
+
 # Style enforcement
 mod_module_files = "deny"
 unnecessary_to_owned = "deny"

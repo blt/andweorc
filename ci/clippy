@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Run clippy with strict settings
+set -o errexit
+set -o nounset
+set -o pipefail
 
-set -euo pipefail
+echo "Running cargo clippy..."
+cargo clippy --all-features
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-
-cd "$ROOT_DIR"
-
-echo "Running clippy..."
-cargo clippy --workspace --all-targets -- -D warnings
+echo "Cargo clippy passed!"

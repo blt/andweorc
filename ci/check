@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Type-check all crates
+set -o errexit
+set -o nounset
+set -o pipefail
 
-set -euo pipefail
+echo "Running cargo check..."
+cargo check --locked --all-features --tests
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-
-cd "$ROOT_DIR"
-
-echo "Type-checking all crates..."
-cargo check --workspace --all-targets
+echo "Cargo check passed!"

@@ -1,35 +1,58 @@
 #!/usr/bin/env bash
-# Full validation suite for andweorc
-# Run this before every commit
+set -o errexit
+set -o nounset
+set -o pipefail
 
-set -euo pipefail
+# This script runs all CI checks in order from simplest to most complex. Exits
+# on the first failure.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+echo "=== Running CI validation suite ==="
+echo
 
-cd "$ROOT_DIR"
+# Function to run a script and handle errors
+run_check() {
+    local script="$1"
+    local name="$2"
 
-echo "=== Running full validation ==="
-echo ""
+    echo ">>> Running $name..."
+    if ! "$script"; then
+        echo "FAILED: $name failed!"
+        exit 1
+    fi
+    echo "PASSED: $name passed!"
+    echo
+}
 
-echo "--- Format check ---"
-"$SCRIPT_DIR/fmt" --check
+# Get the directory where this script is located
+CI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo ""
-echo "--- Clippy ---"
-"$SCRIPT_DIR/clippy"
+# Run checks in order from simplest to most complex
+run_check "$CI_DIR/shellcheck" "shellcheck"
+run_check "$CI_DIR/fmt" "cargo fmt"
+run_check "$CI_DIR/check" "cargo check"
+run_check "$CI_DIR/clippy" "cargo clippy"
+run_check "$CI_DIR/deny" "cargo deny"
+run_check "$CI_DIR/test" "cargo nextest"
 
-echo ""
-echo "--- Check ---"
-"$SCRIPT_DIR/check"
+# Optional checks (don't fail if tools aren't available)
+echo ">>> Running optional checks..."
 
-echo ""
-echo "--- Tests ---"
-"$SCRIPT_DIR/test"
+# Kani proofs (optional)
+if command -v cargo-kani &> /dev/null; then
+    echo ">>> Running kani proofs for each crate..."
+    # shellcheck disable=SC2043
+    for crate in andweorc; do
+        echo ">>> Running kani proofs for $crate..."
+        if ! "$CI_DIR/kani" "$crate"; then
+            echo "FAILED: kani proofs for $crate failed!"
+            exit 1
+        fi
+        echo "PASSED: kani proofs for $crate passed!"
+        echo
+    done
+else
+    echo "WARNING: Skipping kani proofs (kani not installed)"
+fi
 
-echo ""
-echo "--- Deny check ---"
-"$SCRIPT_DIR/deny"
-
-echo ""
-echo "=== All validations passed ==="
+echo
+echo "=== SUCCESS: All CI checks passed! ==="

@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
-# Format code with rustfmt
+set -o errexit
+set -o nounset
+set -o pipefail
 
-set -euo pipefail
+echo "Running cargo fmt..."
+cargo fmt --all -- --check
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-
-cd "$ROOT_DIR"
-
-if [[ "${1:-}" == "--check" ]]; then
-    echo "Checking formatting..."
-    cargo fmt --all -- --check
-else
-    echo "Formatting code..."
-    cargo fmt --all
-fi
+echo "Cargo fmt passed!"
