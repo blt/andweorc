@@ -1,0 +1,8 @@
+# Clippy configuration for andweorc
+# Allow these identifiers in documentation without backticks
+doc-valid-idents = [
+    "Coz",
+    "SIGPROF",
+    "perf_event_open",
+    ".."
+]

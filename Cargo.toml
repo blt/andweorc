@@ -1,2 +1,69 @@
 [workspace]
-members = ["cargo-andweorc", "andweorc"]
+resolver = "2"
+members = ["cargo-andweorc", "andweorc", "andweorc-macros"]
+
+[workspace.lints.clippy]
+# Deny all major clippy categories
+all = "deny"
+pedantic = "deny"
+perf = "deny"
+suspicious = "deny"
+complexity = "deny"
+
+# Correctness: no unwrap in production code
+unwrap_used = "deny"
+expect_used = "deny"
+
+# No debug artifacts
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Memory discipline
+redundant_allocation = "deny"
+rc_buffer = "deny"
+large_futures = "deny"
+large_stack_arrays = "deny"
+
+# Numeric correctness
+float_cmp = "deny"
+
+# Style enforcement
+mod_module_files = "deny"
+unnecessary_to_owned = "deny"
+
+[workspace.lints.rust]
+# Treat warnings as errors
+warnings = "deny"
+
+# Unused code is a sign of incomplete work
+unused_extern_crates = "deny"
+unused_allocation = "deny"
+unused_assignments = "deny"
+unused_comparisons = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+
+# Documentation requirements
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+missing_copy_implementations = "deny"
+
+# Visibility hygiene
+unreachable_pub = "deny"
+
+# Allow cfg for verification tools
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+debug = 2
+split-debuginfo = "unpacked"
+
+[profile.dev]
+panic = "abort"
+debug = 2
+split-debuginfo = "unpacked"

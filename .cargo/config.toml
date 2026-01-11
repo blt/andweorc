@@ -1,0 +1,8 @@
+# Cargo configuration for andweorc
+# Frame pointers are required for accurate stack unwinding during profiling
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "force-frame-pointers=yes"]

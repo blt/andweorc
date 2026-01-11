@@ -304,12 +304,19 @@ use spin::Once;
 // pthread_exit
 //
 static PTHREAD_EXIT: Once<extern "C" fn(*const c_void) -> !> = Once::new();
+/// Intercepts `pthread_exit` for profiler bookkeeping.
+///
+/// # Safety
+///
+/// This function is called from C code via the cdylib. The caller must ensure
+/// that `retval` is valid or null.
 #[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI, not Rust module visibility
 pub unsafe extern "C" fn pthread_exit(retval: *const c_void) -> ! {
     // crate::experiment::EXPERIMENT.deregister_thread(pthread_self());
 
     PTHREAD_EXIT.call_once(|| {
-        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_exit".as_ptr() as *const i8);
+        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_exit".as_ptr().cast::<i8>());
         mem::transmute::<*mut c_void, extern "C" fn(*const c_void) -> !>(ptr)
     })(retval)
 }
@@ -338,7 +345,14 @@ static PTHREAD_CREATE: Once<
         arg: *const c_void,
     ) -> c_int,
 > = Once::new();
+/// Intercepts `pthread_create` to register new threads with the profiler.
+///
+/// # Safety
+///
+/// This function is called from C code via the cdylib. All pointer parameters
+/// must be valid according to `pthread_create`'s contract.
 #[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI, not Rust module visibility
 pub unsafe extern "C" fn pthread_create(
     thread: *const pthread_t,
     attr: *const pthread_attr_t,
@@ -347,7 +361,7 @@ pub unsafe extern "C" fn pthread_create(
 ) -> c_int {
     crate::experiment::get_instance().register_thread(pthread_self());
     PTHREAD_CREATE.call_once(|| {
-        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_create".as_ptr() as *const i8);
+        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_create".as_ptr().cast::<i8>());
         mem::transmute::<
             *mut c_void,
             extern "C" fn(

@@ -2,19 +2,31 @@
 name = "andweorc"
 version = "0.1.0"
 edition = "2021"
+description = "A causal profiler for Rust programs"
+license = "MIT"
+publish = false
 
 [lib]
 crate-type = ["lib", "cdylib"]
+doctest = false
 
 [dependencies]
-nix = { version = "0.23", default_features = false }
-spin = { version = "0.9", default_features = false, features = ["once"] }
-libc = { version = "0.2", default_features = false }
-libc-print = { version = "0.1", default_features = false }
-dashmap = { version = "5.0", default_features = false }
-signal-hook = { version = "0.3", default_features = false }
-rand = { version = "0.8", default_features = false, features = ["small_rng"] }
-# procmaps = "0.4"
-# addr2line = { version = "0.17", default_features = false }
-# memmap = "0.7"
-perf-event = { git = "https://github.com/blt/perf-event", branch = "bobbobbio_smash", default_features = false }
+nix = { version = "0.23", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["once"] }
+libc = { version = "0.2", default-features = false }
+libc-print = { version = "0.1", default-features = false }
+dashmap = { version = "5.5", default-features = false }
+signal-hook = { version = "0.3", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+perf-event = { git = "https://github.com/blt/perf-event", rev = "2b55339d0ff6440b0b7156c8d16d9dc896a4372f", default-features = false }
+andweorc-macros = { path = "../andweorc-macros" }
+backtrace = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+proptest = "1.4"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints]
+workspace = true

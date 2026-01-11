@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run Kani formal verification
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+cd "$ROOT_DIR"
+
+CRATE="${1:-}"
+
+if [[ -z "$CRATE" ]]; then
+    echo "Usage: $0 <crate>"
+    echo "Example: $0 andweorc"
+    exit 1
+fi
+
+if ! command -v cargo-kani &> /dev/null; then
+    echo "cargo-kani not installed"
+    echo "Install from: https://model-checking.github.io/kani/"
+    exit 1
+fi
+
+echo "Running Kani proofs for $CRATE..."
+cargo kani --package "$CRATE" --solver cadical

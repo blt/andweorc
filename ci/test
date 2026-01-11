@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run all tests
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+cd "$ROOT_DIR"
+
+# CI should use more proptest cases
+if [[ "${CI:-}" == "true" ]]; then
+    export PROPTEST_CASES="${PROPTEST_CASES:-512}"
+    export PROPTEST_MAX_SHRINK_ITERS="${PROPTEST_MAX_SHRINK_ITERS:-10000}"
+    export PROPTEST_MAX_SHRINK_TIME="${PROPTEST_MAX_SHRINK_TIME:-60000}"
+else
+    export PROPTEST_CASES="${PROPTEST_CASES:-64}"
+fi
+
+echo "Running tests with PROPTEST_CASES=$PROPTEST_CASES..."
+
+# Use nextest if available, otherwise cargo test
+if command -v cargo-nextest &> /dev/null; then
+    cargo nextest run --workspace
+else
+    cargo test --workspace
+fi

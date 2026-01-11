@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Type-check all crates
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+cd "$ROOT_DIR"
+
+echo "Type-checking all crates..."
+cargo check --workspace --all-targets
