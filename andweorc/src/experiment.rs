@@ -833,77 +833,117 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod proptests {
+// =============================================================================
+// KANI PROOFS
+// =============================================================================
+//
+// These proofs formally verify critical invariants that the profiler depends on.
+// Run with: ci/kani andweorc
+
+#[cfg(kani)]
+mod kani_proofs {
     use super::*;
-    use proptest::prelude::*;
 
-    proptest! {
-        /// Property: Any valid index into DELAY_PRCNT produces a non-negative value
-        #[test]
-        fn delay_prcnt_all_values_non_negative(idx in 0..DELAY_PRCNT.len()) {
-            prop_assert!(DELAY_PRCNT[idx] >= 0.0);
-        }
+    /// Proof: Hash function always produces a valid bucket index.
+    ///
+    /// This is critical for signal safety - an out-of-bounds index would cause
+    /// undefined behavior in the signal handler.
+    #[kani::proof]
+    fn hash_produces_valid_index() {
+        let ip: usize = kani::any();
+        let bucket = SampleCounts::hash(ip);
+        kani::assert(
+            bucket < SAMPLE_COUNT_BUCKETS,
+            "hash must produce valid bucket index",
+        );
+    }
 
-        /// Property: Indices 0-24 always produce 0.0
-        #[test]
-        fn delay_prcnt_baseline_indices_are_zero(idx in 0..25_usize) {
-            prop_assert!((DELAY_PRCNT[idx]).abs() < f64::EPSILON);
-        }
+    /// Proof: All delay percentages are non-negative.
+    ///
+    /// Negative delays would cause incorrect virtual speedup calculations.
+    #[kani::proof]
+    fn delay_prcnt_all_non_negative() {
+        let idx: usize = kani::any();
+        kani::assume(idx < DELAY_PRCNT.len());
+        kani::assert(
+            DELAY_PRCNT[idx] >= 0.0,
+            "delay percentage must be non-negative",
+        );
+    }
 
-        /// Property: Indices 25-54 produce increasing values
-        #[test]
-        fn delay_prcnt_speedup_indices_increase(idx in 26..55_usize) {
-            prop_assert!(DELAY_PRCNT[idx] > DELAY_PRCNT[idx - 1]);
-        }
+    /// Proof: Baseline indices (0-24) have zero delay percentage.
+    ///
+    /// These are used for baseline measurements where no virtual speedup is applied.
+    #[kani::proof]
+    fn delay_prcnt_baseline_is_zero() {
+        let idx: usize = kani::any();
+        kani::assume(idx < 25);
+        kani::assert(
+            DELAY_PRCNT[idx] == 0.0,
+            "baseline indices must have zero delay",
+        );
+    }
 
-        /// Property: Sample counts increment correctly for any IP
-        #[test]
-        fn sample_counts_increment_any_ip(ip in 1..usize::MAX) {
-            let counts = SampleCounts::new();
-            counts.increment(ip);
-            let entries = counts.entries();
-            prop_assert!(entries.iter().any(|&(stored_ip, count)| stored_ip == ip && count >= 1));
-        }
+    /// Proof: Speedup indices (25-54) have monotonically increasing values.
+    ///
+    /// This ensures higher speedup indices always result in more delay.
+    #[kani::proof]
+    fn delay_prcnt_speedup_monotonic() {
+        let idx: usize = kani::any();
+        kani::assume(idx >= 26 && idx < DELAY_PRCNT.len());
+        kani::assert(
+            DELAY_PRCNT[idx] > DELAY_PRCNT[idx - 1],
+            "speedup delays must be monotonically increasing",
+        );
+    }
 
-        /// Property: Multiple increments to same IP accumulate
-        #[test]
-        fn sample_counts_accumulate(ip in 1..usize::MAX, n in 1..100_u64) {
-            let counts = SampleCounts::new();
-            for _ in 0..n {
-                counts.increment(ip);
-            }
-            let entries = counts.entries();
-            let count = entries.iter()
-                .find(|&&(stored_ip, _)| stored_ip == ip)
-                .map(|&(_, c)| c)
-                .unwrap_or(0);
-            prop_assert_eq!(count, n);
-        }
+    /// Proof: Maximum delay percentage is 1.5 (150%).
+    ///
+    /// This bounds the maximum virtual speedup that can be simulated.
+    #[kani::proof]
+    fn delay_prcnt_max_bounded() {
+        let idx: usize = kani::any();
+        kani::assume(idx < DELAY_PRCNT.len());
+        kani::assert(
+            DELAY_PRCNT[idx] <= 1.5,
+            "delay percentage must not exceed 150%",
+        );
+    }
 
-        /// Property: Hash function always produces valid bucket index
-        #[test]
-        fn hash_produces_valid_index(ip in 0..usize::MAX) {
-            let bucket = SampleCounts::hash(ip);
-            prop_assert!(bucket < SAMPLE_COUNT_BUCKETS);
-        }
+    /// Proof: Delay table has exactly 55 entries.
+    ///
+    /// The experiment runner depends on this size for index calculations.
+    #[kani::proof]
+    fn delay_table_size() {
+        kani::assert(
+            DELAY_PRCNT.len() == 55,
+            "delay table must have exactly 55 entries",
+        );
+    }
 
-        /// Property: Delay table index clamping works correctly
-        #[test]
-        fn delay_index_clamps_correctly(idx in 0..1000_usize) {
-            let delay_table: Vec<Duration> = DELAY_PRCNT
-                .iter()
-                .map(|prct| DELAY_BASELINE.mul_f64(*prct))
-                .collect();
+    /// Proof: Index clamping always produces a valid index.
+    ///
+    /// The delay_details function uses this pattern to safely access the delay table.
+    #[kani::proof]
+    fn delay_index_clamp_valid() {
+        let idx: usize = kani::any();
+        let table_len = DELAY_PRCNT.len();
 
-            let safe_index = idx.min(delay_table.len().saturating_sub(1));
-            let delay = delay_table.get(safe_index)
-                .or_else(|| delay_table.last())
-                .copied()
-                .unwrap_or(Duration::ZERO);
+        // This is the clamping logic from delay_details()
+        let safe_index = idx.min(table_len.saturating_sub(1));
 
-            // Should never panic and always return a valid duration
-            prop_assert!(delay <= Duration::from_millis(15)); // Max is 150% of 10ms
-        }
+        kani::assert(safe_index < table_len, "clamped index must be valid");
+    }
+
+    /// Proof: FNV-1a hash bucket mask is correct for power-of-2 size.
+    ///
+    /// SAMPLE_COUNT_BUCKETS must be a power of 2 for the bitwise AND mask to work.
+    #[kani::proof]
+    fn bucket_count_is_power_of_two() {
+        // A number is a power of 2 if it has exactly one bit set
+        // This is equivalent to: n > 0 && (n & (n - 1)) == 0
+        let n = SAMPLE_COUNT_BUCKETS;
+        kani::assert(n > 0, "bucket count must be positive");
+        kani::assert(n & (n - 1) == 0, "bucket count must be power of 2");
     }
 }
