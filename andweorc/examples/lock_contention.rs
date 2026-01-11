@@ -13,6 +13,8 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::print_stdout)]
+#![allow(clippy::print_stderr)]
+#![allow(clippy::uninlined_format_args)]
 #![allow(dead_code)]
 
 use andweorc::progress;

@@ -11,6 +11,13 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::print_stdout)]
+#![allow(clippy::print_stderr)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::manual_is_multiple_of)]
 
 use andweorc::progress;
 use std::sync::atomic::{AtomicBool, Ordering};

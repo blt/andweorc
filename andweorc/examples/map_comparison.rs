@@ -1,16 +1,20 @@
-//! Example: HashMap vs BTreeMap comparison.
+//! Example: `HashMap` vs `BTreeMap` comparison.
 //!
-//! This example compares HashMap and BTreeMap performance patterns
+//! This example compares `HashMap` and `BTreeMap` performance patterns
 //! to demonstrate how causal profiling can identify which data
 //! structure is the bottleneck for different access patterns.
 //!
-//! HashMap: O(1) average lookup, O(n) worst case
-//! BTreeMap: O(log n) lookup, better cache locality for range queries
+//! `HashMap`: O(1) average lookup, O(n) worst case
+//! `BTreeMap`: O(log n) lookup, better cache locality for range queries
 
 // Examples are demonstration code - allow more relaxed rules
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::print_stdout)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::explicit_iter_loop)]
 #![allow(dead_code)]
 #![allow(unused_assignments)]
 

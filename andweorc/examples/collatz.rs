@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::print_stdout)]
+#![allow(clippy::uninlined_format_args)]
 #![allow(clippy::unnecessary_wraps)]
 #![allow(clippy::manual_is_multiple_of)]
 

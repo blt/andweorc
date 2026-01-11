@@ -120,9 +120,17 @@ impl PerThreadProfiler {
         interval: Duration,
     ) -> Result<(), IntervalError> {
         // Get the current thread ID
+        // SAFETY: gettid is a simple syscall that requires no special privileges
+        let tid_raw = unsafe { libc::syscall(libc::SYS_gettid) };
+
+        // gettid should never fail, but check anyway
+        if tid_raw < 0 {
+            return Err(IntervalError::CreateFailed(std::io::Error::last_os_error()));
+        }
+
         // gettid returns pid_t which fits in i32 on Linux
         #[allow(clippy::cast_possible_truncation)]
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+        let tid = tid_raw as libc::pid_t;
 
         // Create and start the timer
         let timer = Interval::new(tid, libc::SIGPROF)?;

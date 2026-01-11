@@ -1,8 +1,12 @@
 //! Debug example to test perf-event configuration.
 
+// Examples are not production code - allow relaxed linting
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_precision_loss)]
 
 use perf_event::events::Hardware;
 use perf_event::sample::PerfSampleType;

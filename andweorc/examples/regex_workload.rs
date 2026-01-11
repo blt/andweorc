@@ -13,6 +13,11 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::print_stdout)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::struct_field_names)]
+#![allow(clippy::map_unwrap_or)]
 
 use andweorc::progress;
 use regex::Regex;

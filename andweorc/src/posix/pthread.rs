@@ -310,13 +310,20 @@ static PTHREAD_EXIT: Once<extern "C" fn(*const c_void) -> !> = Once::new();
 ///
 /// This function is called from C code via the cdylib. The caller must ensure
 /// that `retval` is valid or null.
+///
+/// # Panics
+///
+/// Panics if dlsym cannot find the real `pthread_exit` function. This should
+/// only happen if the module is used incorrectly (not via LD_PRELOAD).
 #[no_mangle]
 #[allow(unreachable_pub)] // Exposed via C ABI, not Rust module visibility
 pub unsafe extern "C" fn pthread_exit(retval: *const c_void) -> ! {
     // crate::experiment::EXPERIMENT.deregister_thread(pthread_self());
 
     PTHREAD_EXIT.call_once(|| {
-        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_exit".as_ptr().cast::<i8>());
+        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_exit\0".as_ptr().cast::<i8>());
+        // dlsym returns NULL if RTLD_NEXT lookup fails (e.g., not loaded via LD_PRELOAD)
+        assert!(!ptr.is_null(), "dlsym failed to find pthread_exit - this module requires LD_PRELOAD");
         mem::transmute::<*mut c_void, extern "C" fn(*const c_void) -> !>(ptr)
     })(retval)
 }
@@ -351,6 +358,11 @@ static PTHREAD_CREATE: Once<
 ///
 /// This function is called from C code via the cdylib. All pointer parameters
 /// must be valid according to `pthread_create`'s contract.
+///
+/// # Panics
+///
+/// Panics if dlsym cannot find the real `pthread_create` function. This should
+/// only happen if the module is used incorrectly (not via LD_PRELOAD).
 #[no_mangle]
 #[allow(unreachable_pub)] // Exposed via C ABI, not Rust module visibility
 pub unsafe extern "C" fn pthread_create(
@@ -361,7 +373,9 @@ pub unsafe extern "C" fn pthread_create(
 ) -> c_int {
     crate::experiment::get_instance().register_thread(pthread_self());
     PTHREAD_CREATE.call_once(|| {
-        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_create".as_ptr().cast::<i8>());
+        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_create\0".as_ptr().cast::<i8>());
+        // dlsym returns NULL if RTLD_NEXT lookup fails (e.g., not loaded via LD_PRELOAD)
+        assert!(!ptr.is_null(), "dlsym failed to find pthread_create - this module requires LD_PRELOAD");
         mem::transmute::<
             *mut c_void,
             extern "C" fn(
