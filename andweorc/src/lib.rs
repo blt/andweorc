@@ -42,8 +42,16 @@ pub mod progress_point;
 pub mod runner;
 mod timer;
 
-use nix::sys::pthread::pthread_self;
+use per_thread::PerThreadProfiler;
+use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::Duration;
+
+// Thread-local storage for the profiling timer.
+// Each thread has its own timer that delivers SIGPROF signals.
+thread_local! {
+    static PROFILING_TIMER: RefCell<Option<timer::Interval>> = const { RefCell::new(None) };
+}
 
 /// Resolves an instruction pointer to a source location string.
 fn resolve_symbol(ip: usize) -> String {
@@ -77,6 +85,11 @@ fn resolve_symbol(ip: usize) -> String {
 /// # Errors
 ///
 /// Returns an error string if the timer cannot be created or started.
+///
+/// # Panics
+///
+/// Panics if the experiment singleton failed to initialize (e.g., SIGPROF
+/// signal handler could not be registered).
 pub fn start_profiling() -> Result<(), String> {
     start_profiling_with_interval(Duration::from_millis(10))
 }
@@ -89,20 +102,42 @@ pub fn start_profiling() -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// Returns an error string if the timer cannot be created or started.
+/// Returns an error string if the timer cannot be created or started, or if
+/// profiling is already active for this thread.
+///
+/// # Panics
+///
+/// Panics if the experiment singleton failed to initialize (e.g., SIGPROF
+/// signal handler could not be registered).
 pub fn start_profiling_with_interval(interval: Duration) -> Result<(), String> {
-    let tid = pthread_self();
-    let exp = experiment::get_instance();
+    // Check if profiling is already active for this thread
+    let already_profiling = PROFILING_TIMER.with(|cell| cell.borrow().is_some());
+    if already_profiling {
+        return Err("profiling already active for this thread".to_string());
+    }
 
-    // IMPORTANT: Create the thread state BEFORE starting the timer
-    // This avoids deadlock where the signal handler tries to create the thread state
-    // while we're in the middle of creating it.
-    let _ = exp.thread_state(tid);
+    // Ensure the experiment singleton is initialized (this registers the signal handler)
+    let _ = experiment::get_instance();
+
+    // IMPORTANT: Create the per-thread profiler BEFORE starting the timer.
+    // This avoids deadlock where the signal handler tries to access the profiler
+    // while we're in the middle of creating it. The profiler is stored in
+    // thread-local storage and accessed from the signal handler without locks.
+    let profiler = Arc::new(PerThreadProfiler::new(16));
+    experiment::set_thread_profiler(profiler);
 
     // Get the current thread ID (Linux specific)
+    // SAFETY: gettid is a simple syscall that requires no special privileges
+    let kernel_tid_raw = unsafe { libc::syscall(libc::SYS_gettid) };
+
+    // gettid returns -1 on error (though this should never happen for gettid)
+    if kernel_tid_raw < 0 {
+        return Err("gettid syscall failed".to_string());
+    }
+
     // gettid returns pid_t which fits in i32 on Linux
     #[allow(clippy::cast_possible_truncation)]
-    let kernel_tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+    let kernel_tid = kernel_tid_raw as libc::pid_t;
 
     let timer = timer::Interval::new(kernel_tid, libc::SIGPROF)
         .map_err(|e| format!("failed to create timer: {e}"))?;
@@ -110,24 +145,38 @@ pub fn start_profiling_with_interval(interval: Duration) -> Result<(), String> {
         .start(interval)
         .map_err(|e| format!("failed to start timer: {e}"))?;
 
-    // Store the timer so it stays alive
-    // TODO: This leaks the timer - need proper lifecycle management
-    std::mem::forget(timer);
+    // Store the timer in thread-local storage
+    // The timer's Drop implementation will call timer_delete when the thread exits
+    // or when stop_profiling() is called
+    PROFILING_TIMER.with(|cell| {
+        *cell.borrow_mut() = Some(timer);
+    });
 
     Ok(())
 }
 
 /// Stops profiling for the current thread.
 ///
-/// This stops the interval timer and stops collecting samples.
+/// This stops the interval timer and prevents further SIGPROF signals from being
+/// delivered to this thread. The timer resources are cleaned up via the timer's
+/// Drop implementation (which calls `timer_delete`).
+///
+/// It is safe to call this function even if profiling was never started for this
+/// thread - it will simply do nothing in that case.
 ///
 /// # Note
 ///
-/// Currently this is not fully implemented - the timer is leaked when started.
-/// This will be fixed when proper lifecycle management is added.
+/// This only stops profiling for the calling thread. Other threads that have
+/// started profiling will continue to receive signals.
 pub fn stop_profiling() {
-    // TODO: Implement proper timer lifecycle management
-    // For now, we just note that this should stop the timer
+    PROFILING_TIMER.with(|cell| {
+        if let Some(timer) = cell.borrow_mut().take() {
+            // Stop the timer before dropping to ensure no more signals are delivered
+            // Ignore errors since we're stopping anyway
+            let _ = timer.stop();
+            // Timer is dropped here, which calls timer_delete via Drop
+        }
+    });
 }
 
 /// Re-export the profile attribute macro.
@@ -150,6 +199,11 @@ pub use andweorc_macros::profile;
 /// # Errors
 ///
 /// Returns an error if profiling was requested but could not be started.
+///
+/// # Panics
+///
+/// Panics if the experiment singleton failed to initialize (e.g., SIGPROF
+/// signal handler could not be registered) while `ANDWEORC_ENABLED=1` is set.
 pub fn init() -> Result<(), String> {
     if std::env::var("ANDWEORC_ENABLED").is_ok_and(|v| v == "1") {
         start_profiling()?;
@@ -171,6 +225,12 @@ pub fn init() -> Result<(), String> {
 ///
 /// * `progress_point` - Name of the progress point to measure throughput against.
 ///
+/// # Returns
+///
+/// Returns `Some` with a static reference to the profiling results if profiling
+/// is enabled, `None` otherwise. The reference is valid for the lifetime of the
+/// program (the results are intentionally leaked to provide a stable reference).
+///
 /// # Example
 ///
 /// ```ignore
@@ -186,7 +246,12 @@ pub fn init() -> Result<(), String> {
 pub fn run_experiments(progress_point: &'static str) -> Option<&'static runner::ProfilingResults> {
     if std::env::var("ANDWEORC_ENABLED").is_ok_and(|v| v == "1") {
         let runner = runner::Runner::new();
-        let results = runner.run(progress_point);
+        let _ = runner.run(progress_point);
+
+        // Leak the runner to get a static reference to results
+        // This is intentional - results need to outlive the function call
+        let leaked_runner = Box::leak(Box::new(runner));
+        let results = leaked_runner.results();
 
         // Output in machine-parseable format for CLI
         for ip in results.profiled_ips() {
@@ -221,8 +286,7 @@ pub fn run_experiments(progress_point: &'static str) -> Option<&'static runner::
             libc_print::libc_println!("Make sure the program ran long enough to collect samples.");
         }
 
-        // Note: This returns a dangling reference - need to fix
-        None // For now, return None to avoid memory issues
+        Some(results)
     } else {
         None
     }

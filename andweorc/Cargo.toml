@@ -15,7 +15,6 @@ nix = { version = "0.23", default-features = false }
 spin = { version = "0.9", default-features = false, features = ["once"] }
 libc = { version = "0.2", default-features = false }
 libc-print = { version = "0.1", default-features = false }
-dashmap = { version = "5.5", default-features = false }
 signal-hook = { version = "0.3", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 perf-event = { git = "https://github.com/blt/perf-event", rev = "2b55339d0ff6440b0b7156c8d16d9dc896a4372f", default-features = false }
@@ -27,6 +26,11 @@ proptest = "1.4"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "core_ops"
+harness = false
 
 [lints]
 workspace = true
