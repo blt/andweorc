@@ -312,6 +312,12 @@ impl SampleCounts {
     /// # Signal Safety
     ///
     /// This function is async-signal-safe: it only uses atomic operations.
+    ///
+    /// # Memory Ordering
+    ///
+    /// - Relaxed loads for checking existing entries (hot path)
+    /// - Release on successful slot claim to publish the IP
+    /// - Relaxed for count increments (counts are always read with Acquire)
     fn increment(&self, ip: usize) {
         if ip == 0 {
             return; // 0 is reserved for empty slots
@@ -333,7 +339,8 @@ impl SampleCounts {
 
             if current == 0 {
                 // Empty slot - try to claim it
-                match self.ips[idx].compare_exchange(0, ip, Ordering::Relaxed, Ordering::Relaxed) {
+                // Use Release on success to publish the IP to readers
+                match self.ips[idx].compare_exchange(0, ip, Ordering::Release, Ordering::Relaxed) {
                     Ok(_) => {
                         // Successfully claimed the slot
                         self.counts[idx].fetch_add(1, Ordering::Relaxed);
@@ -355,12 +362,20 @@ impl SampleCounts {
     }
 
     /// Returns all (IP, count) pairs with non-zero counts.
+    ///
+    /// # Memory Ordering
+    ///
+    /// Uses Acquire loads to synchronize with Release stores in `increment()`.
+    /// This ensures we see all counts that were incremented before we read.
+    /// Call this only after all profiling threads have stopped.
     fn entries(&self) -> Vec<(usize, u64)> {
         let mut result = Vec::new();
         for i in 0..SAMPLE_COUNT_BUCKETS {
-            let ip = self.ips[i].load(Ordering::Relaxed);
+            // Acquire synchronizes with Release in increment() when slot was claimed
+            let ip = self.ips[i].load(Ordering::Acquire);
             if ip != 0 {
-                let count = self.counts[i].load(Ordering::Relaxed);
+                // Acquire to see all count updates
+                let count = self.counts[i].load(Ordering::Acquire);
                 if count > 0 {
                     result.push((ip, count));
                 }

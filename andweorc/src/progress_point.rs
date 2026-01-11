@@ -107,16 +107,19 @@ impl Progress {
     /// meaningful work (e.g., processing one request, completing one iteration).
     pub fn note_visit(&self) {
         let now = monotonic_nanos();
-        self.visits.fetch_add(1, Ordering::Relaxed);
+        // Use Release to publish the increment to readers
+        self.visits.fetch_add(1, Ordering::Release);
 
         // Set first visit timestamp if this is the first visit
         // Use compare_exchange to atomically set only if still 0
+        // Release on success to publish the timestamp
         let _ = self
             .first_visit_ns
-            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+            .compare_exchange(0, now, Ordering::Release, Ordering::Relaxed);
 
         // Always update last visit timestamp
-        self.last_visit_ns.store(now, Ordering::Relaxed);
+        // Use Release to publish to readers
+        self.last_visit_ns.store(now, Ordering::Release);
     }
 
     /// Returns the total number of visits.
@@ -130,8 +133,9 @@ impl Progress {
     /// Returns 0 if there have been fewer than 2 visits.
     #[must_use]
     pub fn elapsed_nanos(&self) -> u64 {
-        let first = self.first_visit_ns.load(Ordering::Relaxed);
-        let last = self.last_visit_ns.load(Ordering::Relaxed);
+        // Use Acquire to synchronize with Release stores in note_visit/reset
+        let first = self.first_visit_ns.load(Ordering::Acquire);
+        let last = self.last_visit_ns.load(Ordering::Acquire);
         if first == 0 || last == 0 || last <= first {
             return 0;
         }
@@ -143,7 +147,8 @@ impl Progress {
     /// Returns 0.0 if there's not enough data to calculate throughput.
     #[must_use]
     pub fn throughput(&self) -> f64 {
-        let visits = self.visits.load(Ordering::Relaxed);
+        // Use Acquire to synchronize with Release stores in note_visit/reset
+        let visits = self.visits.load(Ordering::Acquire);
         if visits < 2 {
             return 0.0;
         }
@@ -162,10 +167,26 @@ impl Progress {
     }
 
     /// Resets the progress point counters and timestamps.
+    ///
+    /// # Concurrency Note
+    ///
+    /// This method is NOT atomic. If `note_visit()` is called concurrently
+    /// with `reset()`, visits may be lost. This is acceptable for the profiler
+    /// because:
+    ///
+    /// 1. Reset is only called between experiment rounds, not during active profiling
+    /// 2. Lost visits during reset don't produce incorrect throughput values
+    ///    (`throughput()` returns 0.0 for edge cases like zero timestamps)
+    /// 3. The next experiment round will start fresh
+    ///
+    /// Callers should ensure the workload is quiesced before calling reset.
     pub fn reset(&self) {
-        self.visits.store(0, Ordering::Relaxed);
-        self.first_visit_ns.store(0, Ordering::Relaxed);
-        self.last_visit_ns.store(0, Ordering::Relaxed);
+        // Use Release ordering to ensure previous writes are visible before
+        // any reader sees the reset state. Note: this doesn't make the reset
+        // atomic - concurrent note_visit() calls may still race.
+        self.visits.store(0, Ordering::Release);
+        self.first_visit_ns.store(0, Ordering::Release);
+        self.last_visit_ns.store(0, Ordering::Release);
     }
 }
 
