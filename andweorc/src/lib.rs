@@ -47,6 +47,56 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Errors that can occur during profiling operations.
+///
+/// This enum provides structured error information that allows users to
+/// programmatically handle different failure modes.
+#[derive(Debug, Clone)]
+pub enum ProfilingError {
+    /// Profiling is already active for the current thread.
+    ///
+    /// Call `stop_profiling()` first before starting again.
+    AlreadyActive,
+
+    /// Failed to get the kernel thread ID.
+    ///
+    /// This should never happen on Linux systems but is handled gracefully.
+    ThreadIdResolution,
+
+    /// Failed to create the interval timer.
+    ///
+    /// This typically indicates resource limits (check `ulimit -a`) or
+    /// insufficient permissions.
+    TimerCreation(String),
+
+    /// Failed to start the interval timer.
+    ///
+    /// The timer was created but could not be armed.
+    TimerStart(String),
+
+    /// Failed to initialize the experiment singleton.
+    ///
+    /// This typically means the SIGPROF signal handler could not be registered.
+    ExperimentInit(String),
+}
+
+impl std::fmt::Display for ProfilingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyActive => write!(
+                f,
+                "profiling already active for this thread; call stop_profiling() first"
+            ),
+            Self::ThreadIdResolution => write!(f, "failed to get kernel thread ID (gettid)"),
+            Self::TimerCreation(msg) => write!(f, "failed to create timer: {msg}"),
+            Self::TimerStart(msg) => write!(f, "failed to start timer: {msg}"),
+            Self::ExperimentInit(msg) => write!(f, "failed to initialize experiment: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ProfilingError {}
+
 // Thread-local storage for the profiling timer.
 // Each thread has its own timer that delivers SIGPROF signals.
 thread_local! {
@@ -84,13 +134,11 @@ fn resolve_symbol(ip: usize) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error string if the timer cannot be created or started.
-///
-/// # Panics
-///
-/// Panics if the experiment singleton failed to initialize (e.g., SIGPROF
-/// signal handler could not be registered).
-pub fn start_profiling() -> Result<(), String> {
+/// Returns a [`ProfilingError`] if:
+/// - Profiling is already active for this thread
+/// - The timer cannot be created or started
+/// - The experiment singleton failed to initialize
+pub fn start_profiling() -> Result<(), ProfilingError> {
     start_profiling_with_interval(Duration::from_millis(10))
 }
 
@@ -102,18 +150,16 @@ pub fn start_profiling() -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// Returns an error string if the timer cannot be created or started, or if
-/// profiling is already active for this thread.
-///
-/// # Panics
-///
-/// Panics if the experiment singleton failed to initialize (e.g., SIGPROF
-/// signal handler could not be registered).
-pub fn start_profiling_with_interval(interval: Duration) -> Result<(), String> {
+/// Returns a [`ProfilingError`] if:
+/// - Profiling is already active for this thread ([`ProfilingError::AlreadyActive`])
+/// - The kernel thread ID cannot be resolved ([`ProfilingError::ThreadIdResolution`])
+/// - The timer cannot be created ([`ProfilingError::TimerCreation`])
+/// - The timer cannot be started ([`ProfilingError::TimerStart`])
+pub fn start_profiling_with_interval(interval: Duration) -> Result<(), ProfilingError> {
     // Check if profiling is already active for this thread
     let already_profiling = PROFILING_TIMER.with(|cell| cell.borrow().is_some());
     if already_profiling {
-        return Err("profiling already active for this thread".to_string());
+        return Err(ProfilingError::AlreadyActive);
     }
 
     // Ensure the experiment singleton is initialized (this registers the signal handler)
@@ -132,7 +178,7 @@ pub fn start_profiling_with_interval(interval: Duration) -> Result<(), String> {
 
     // gettid returns -1 on error (though this should never happen for gettid)
     if kernel_tid_raw < 0 {
-        return Err("gettid syscall failed".to_string());
+        return Err(ProfilingError::ThreadIdResolution);
     }
 
     // gettid returns pid_t which fits in i32 on Linux
@@ -140,10 +186,10 @@ pub fn start_profiling_with_interval(interval: Duration) -> Result<(), String> {
     let kernel_tid = kernel_tid_raw as libc::pid_t;
 
     let timer = timer::Interval::new(kernel_tid, libc::SIGPROF)
-        .map_err(|e| format!("failed to create timer: {e}"))?;
+        .map_err(|e| ProfilingError::TimerCreation(e.to_string()))?;
     timer
         .start(interval)
-        .map_err(|e| format!("failed to start timer: {e}"))?;
+        .map_err(|e| ProfilingError::TimerStart(e.to_string()))?;
 
     // Store the timer in thread-local storage
     // The timer's Drop implementation will call timer_delete when the thread exits
@@ -198,13 +244,9 @@ pub use andweorc_macros::profile;
 ///
 /// # Errors
 ///
-/// Returns an error if profiling was requested but could not be started.
-///
-/// # Panics
-///
-/// Panics if the experiment singleton failed to initialize (e.g., SIGPROF
-/// signal handler could not be registered) while `ANDWEORC_ENABLED=1` is set.
-pub fn init() -> Result<(), String> {
+/// Returns a [`ProfilingError`] if profiling was requested but could not be started.
+/// See [`start_profiling`] for the specific error conditions.
+pub fn init() -> Result<(), ProfilingError> {
     if std::env::var("ANDWEORC_ENABLED").is_ok_and(|v| v == "1") {
         start_profiling()?;
     }

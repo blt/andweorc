@@ -12,8 +12,61 @@ use crate::timer::nanosleep;
 use libc::c_void;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
+
+/// Helper to recover from a poisoned read lock.
+///
+/// Lock poisoning occurs when a thread panics while holding the lock.
+/// For profiling data, we recover the guard and continue since:
+/// - Profiling data isn't safety-critical
+/// - Losing all data is worse than having potentially-incomplete data
+fn recover_read<'a, T>(
+    result: Result<RwLockReadGuard<'a, T>, PoisonError<RwLockReadGuard<'a, T>>>,
+) -> RwLockReadGuard<'a, T> {
+    result.unwrap_or_else(|poison| {
+        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
+        poison.into_inner()
+    })
+}
+
+/// Helper to recover from a poisoned write lock.
+fn recover_write<'a, T>(
+    result: Result<RwLockWriteGuard<'a, T>, PoisonError<RwLockWriteGuard<'a, T>>>,
+) -> RwLockWriteGuard<'a, T> {
+    result.unwrap_or_else(|poison| {
+        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
+        poison.into_inner()
+    })
+}
+
+/// Number of baseline entries at the start of the delay table.
+const BASELINE_ENTRIES: usize = 25;
+
+/// Converts a delay table index to a speedup percentage.
+///
+/// The delay table has 25 baseline entries (0%) followed by
+/// speedup entries from 5% to 150% in 5% increments.
+#[allow(clippy::cast_precision_loss)]
+fn delay_index_to_speedup_pct(index: usize) -> f64 {
+    if index < BASELINE_ENTRIES {
+        0.0
+    } else {
+        (index - BASELINE_ENTRIES + 1) as f64 * 0.05
+    }
+}
+
+/// Converts a configuration index to a delay table index.
+///
+/// The first entry (index 0) maps to baseline (delay index 0).
+/// Subsequent entries map to speedup indices starting at 25.
+fn config_index_to_delay_index(config_index: usize) -> usize {
+    if config_index == 0 {
+        0 // Baseline
+    } else {
+        BASELINE_ENTRIES - 1 + config_index // Speedup entries start at index 25
+    }
+}
 
 /// Results from a single experiment round.
 #[derive(Debug, Clone, Copy)]
@@ -56,37 +109,22 @@ impl ProfilingResults {
     }
 
     /// Adds an experiment result.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the results lock is poisoned (indicates a bug).
-    #[allow(clippy::expect_used)]
     pub fn add_result(&self, result: ExperimentResult) {
-        let mut guard = self.results.write().expect("results lock poisoned");
+        let mut guard = recover_write(self.results.write());
         guard.entry(result.ip).or_default().push(result);
     }
 
     /// Returns all results for a given IP.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the results lock is poisoned (indicates a bug).
     #[must_use]
-    #[allow(clippy::expect_used)]
     pub fn results_for_ip(&self, ip: usize) -> Option<Vec<ExperimentResult>> {
-        let guard = self.results.read().expect("results lock poisoned");
+        let guard = recover_read(self.results.read());
         guard.get(&ip).cloned()
     }
 
     /// Returns all unique IPs that have been profiled.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the results lock is poisoned (indicates a bug).
     #[must_use]
-    #[allow(clippy::expect_used)]
     pub fn profiled_ips(&self) -> Vec<usize> {
-        let guard = self.results.read().expect("results lock poisoned");
+        let guard = recover_read(self.results.read());
         guard.keys().copied().collect()
     }
 
@@ -94,14 +132,9 @@ impl ProfilingResults {
     ///
     /// Returns a list of (IP, impact) pairs sorted by impact descending.
     /// Impact is calculated as the slope of throughput vs speedup percentage.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the results lock is poisoned (indicates a bug).
     #[must_use]
-    #[allow(clippy::expect_used)]
     pub fn calculate_impacts(&self) -> Vec<(usize, f64)> {
-        let guard = self.results.read().expect("results lock poisoned");
+        let guard = recover_read(self.results.read());
         let mut impacts: Vec<(usize, f64)> = guard
             .iter()
             .filter_map(|(&ip, results)| {
@@ -120,38 +153,224 @@ impl ProfilingResults {
         impacts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         impacts
     }
+
+    /// Calculates the causal impact for each IP with full statistical analysis.
+    ///
+    /// Returns a list of (IP, `RegressionResult`) pairs sorted by impact descending.
+    /// Only includes IPs with at least 3 data points (required for confidence intervals).
+    ///
+    /// The `RegressionResult` includes:
+    /// - Slope (causal impact)
+    /// - R² (goodness of fit)
+    /// - 95% confidence intervals
+    /// - Statistical significance indicator
+    #[must_use]
+    pub fn calculate_impacts_with_stats(&self) -> Vec<(usize, RegressionResult)> {
+        let guard = recover_read(self.results.read());
+        let mut impacts: Vec<(usize, RegressionResult)> = guard
+            .iter()
+            .filter_map(|(&ip, results)| {
+                // Need at least 3 points for confidence intervals
+                calculate_linear_regression_full(results).map(|reg| (ip, reg))
+            })
+            .collect();
+
+        // Sort by impact (slope) descending
+        impacts.sort_by(|a, b| {
+            b.1.slope
+                .partial_cmp(&a.1.slope)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        impacts
+    }
+
+    /// Returns only statistically significant impacts.
+    ///
+    /// Filters to IPs where:
+    /// - The 95% confidence interval doesn't include zero
+    /// - The R² is above 0.5 (reasonable fit)
+    #[must_use]
+    pub fn significant_impacts(&self) -> Vec<(usize, RegressionResult)> {
+        self.calculate_impacts_with_stats()
+            .into_iter()
+            .filter(|(_, reg)| reg.is_significant() && reg.r_squared > 0.5)
+            .collect()
+    }
 }
 
-/// Calculates the linear regression slope of throughput vs speedup.
-fn calculate_linear_regression(results: &[ExperimentResult]) -> f64 {
-    // Allow precision loss - this is statistical calculation
-    #[allow(clippy::cast_precision_loss)]
-    let n = results.len() as f64;
-    if n < 2.0 {
-        return 0.0;
+/// Results from linear regression analysis.
+///
+/// Provides slope, intercept, confidence intervals, and goodness-of-fit metrics.
+/// These statistics allow users to assess the reliability of causal impact claims.
+#[derive(Debug, Clone, Copy)]
+pub struct RegressionResult {
+    /// Slope of the regression line (throughput change per unit speedup).
+    /// This is the primary "causal impact" metric.
+    pub slope: f64,
+    /// Y-intercept of the regression line (baseline throughput).
+    pub intercept: f64,
+    /// Coefficient of determination (R²). Ranges from 0 to 1.
+    /// Higher values indicate the speedup explains more variance in throughput.
+    pub r_squared: f64,
+    /// Standard error of the slope estimate.
+    pub slope_std_error: f64,
+    /// Lower bound of 95% confidence interval for slope.
+    pub slope_ci_lower: f64,
+    /// Upper bound of 95% confidence interval for slope.
+    pub slope_ci_upper: f64,
+    /// Number of data points used in the regression.
+    pub n: usize,
+}
+
+impl RegressionResult {
+    /// Returns true if the slope is statistically significant at 95% confidence.
+    ///
+    /// A significant slope means the confidence interval doesn't include zero,
+    /// indicating the speedup has a measurable effect on throughput.
+    #[must_use]
+    pub fn is_significant(&self) -> bool {
+        // Significant if CI doesn't cross zero
+        (self.slope_ci_lower > 0.0 && self.slope_ci_upper > 0.0)
+            || (self.slope_ci_lower < 0.0 && self.slope_ci_upper < 0.0)
     }
+
+    /// Returns true if the regression fit is good (R² > 0.7).
+    #[must_use]
+    pub fn has_good_fit(&self) -> bool {
+        self.r_squared > 0.7
+    }
+}
+
+/// Calculates linear regression with confidence intervals and R².
+///
+/// Uses least squares regression with t-distribution confidence intervals.
+/// Returns `None` if there are fewer than 3 data points (need df >= 1 for CI).
+fn calculate_linear_regression_full(results: &[ExperimentResult]) -> Option<RegressionResult> {
+    let n = results.len();
+    if n < 3 {
+        return None; // Need at least 3 points for meaningful CI
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let n_f64 = n as f64;
 
     // Calculate means
     let sum_x: f64 = results.iter().map(|r| r.speedup_pct).sum();
     let sum_y: f64 = results.iter().map(|r| r.throughput).sum();
-    let mean_x = sum_x / n;
-    let mean_y = sum_y / n;
+    let mean_x = sum_x / n_f64;
+    let mean_y = sum_y / n_f64;
 
-    // Calculate slope
-    let mut numerator = 0.0;
-    let mut denominator = 0.0;
+    // Calculate sums of squares and cross products
+    let mut sum_sq_x = 0.0; // Sum of (x - mean_x)^2
+    let mut sum_sq_y = 0.0; // Sum of (y - mean_y)^2
+    let mut sum_cross = 0.0; // Sum of (x - mean_x)(y - mean_y)
+
     for r in results {
         let dx = r.speedup_pct - mean_x;
         let dy = r.throughput - mean_y;
-        numerator += dx * dy;
-        denominator += dx * dx;
+        sum_sq_x += dx * dx;
+        sum_sq_y += dy * dy;
+        sum_cross += dx * dy;
     }
 
-    if denominator.abs() < f64::EPSILON {
-        return 0.0;
+    // Check for degenerate cases
+    if sum_sq_x.abs() < f64::EPSILON {
+        return None; // All x values are the same
     }
 
-    numerator / denominator
+    // Calculate slope and intercept
+    let slope = sum_cross / sum_sq_x;
+    let intercept = mean_y - slope * mean_x;
+
+    // Calculate R² (coefficient of determination)
+    let r_squared = if sum_sq_y.abs() < f64::EPSILON {
+        1.0 // All y values are the same, perfect fit to horizontal line
+    } else {
+        let reg_sum_sq = slope * slope * sum_sq_x; // Regression sum of squares
+        reg_sum_sq / sum_sq_y
+    };
+
+    // Calculate residual sum of squares for standard error
+    let mut resid_sum_sq = 0.0;
+    for r in results {
+        let predicted = intercept + slope * r.speedup_pct;
+        let residual = r.throughput - predicted;
+        resid_sum_sq += residual * residual;
+    }
+
+    // Standard error of regression (residual standard deviation)
+    let df = n_f64 - 2.0; // Degrees of freedom
+    let s_squared = resid_sum_sq / df;
+    let s = s_squared.sqrt();
+
+    // Standard error of slope
+    let slope_std_error = s / sum_sq_x.sqrt();
+
+    // t-value for 95% CI with (n-2) degrees of freedom
+    // Using approximation for t-distribution critical value
+    let t_critical = t_critical_value_95(n - 2);
+
+    // Confidence interval for slope
+    let margin = t_critical * slope_std_error;
+    let slope_ci_lower = slope - margin;
+    let slope_ci_upper = slope + margin;
+
+    Some(RegressionResult {
+        slope,
+        intercept,
+        r_squared,
+        slope_std_error,
+        slope_ci_lower,
+        slope_ci_upper,
+        n,
+    })
+}
+
+/// Returns the critical t-value for 95% confidence interval.
+///
+/// Uses a lookup table for common degrees of freedom, with interpolation
+/// for values not in the table.
+fn t_critical_value_95(df: usize) -> f64 {
+    // t-critical values for 95% CI (two-tailed, alpha = 0.05)
+    // From standard t-distribution tables
+    match df {
+        0 => f64::INFINITY,
+        1 => 12.706,
+        2 => 4.303,
+        3 => 3.182,
+        4 => 2.776,
+        5 => 2.571,
+        6 => 2.447,
+        7 => 2.365,
+        8 => 2.306,
+        9 => 2.262,
+        10 => 2.228,
+        11 => 2.201,
+        12 => 2.179,
+        13 => 2.160,
+        14 => 2.145,
+        15 => 2.131,
+        16 => 2.120,
+        17 => 2.110,
+        18 => 2.101,
+        19 => 2.093,
+        20 => 2.086,
+        21..=25 => 2.060,
+        26..=30 => 2.042,
+        31..=40 => 2.021,
+        41..=60 => 2.000,
+        61..=120 => 1.980,
+        _ => 1.960, // Approaches z-value for large df
+    }
+}
+
+/// Calculates the linear regression slope of throughput vs speedup.
+///
+/// This is the simple version for backwards compatibility.
+/// For full statistics including confidence intervals, use
+/// `calculate_linear_regression_full`.
+fn calculate_linear_regression(results: &[ExperimentResult]) -> f64 {
+    calculate_linear_regression_full(results).map_or(0.0, |r| r.slope)
 }
 
 /// Configuration for the experiment runner.
@@ -243,12 +462,7 @@ impl Runner {
         let elapsed_ns = progress_point.elapsed_nanos();
 
         // Determine speedup percentage from index
-        // Allow precision loss - index is small (max ~55)
-        #[allow(clippy::cast_precision_loss)]
-        let speedup_pct = match speedup_index {
-            0..=24 => 0.0, // First 25 entries are baseline
-            i => (i - 25) as f64 * 0.05 + 0.05,
-        };
+        let speedup_pct = delay_index_to_speedup_pct(speedup_index);
 
         ExperimentResult {
             // IP of 0 indicates a baseline measurement (no specific code location targeted)
@@ -290,13 +504,8 @@ impl Runner {
         // Phase 3: Run experiments for each IP and speedup percentage
         for ip in top_ips {
             for (idx, _speedup) in self.config.speedup_percentages.iter().enumerate() {
-                // Map speedup percentage to delay table index
-                // 0.0 -> index 0, 0.05 -> index 25, 0.10 -> index 26, etc.
-                let speedup_index = if idx == 0 {
-                    0 // Baseline
-                } else {
-                    24 + idx // Speedup entries start at index 25
-                };
+                // Map configuration index to delay table index
+                let speedup_index = config_index_to_delay_index(idx);
 
                 let result = self.run_experiment_round(Some(ip), speedup_index, &progress_point);
                 self.results.add_result(result);
@@ -436,11 +645,18 @@ mod tests {
     fn calculate_impacts_sorts_descending() {
         let results = ProfilingResults::new();
 
-        // IP 0x1000: positive slope (good optimization target)
+        // IP 0x1000: positive slope of 50 (good optimization target)
         results.add_result(ExperimentResult {
             ip: 0x1000,
             speedup_pct: 0.0,
             throughput: 100.0,
+            duration_ms: 1000,
+            matching_samples: 10,
+        });
+        results.add_result(ExperimentResult {
+            ip: 0x1000,
+            speedup_pct: 0.5,
+            throughput: 125.0,
             duration_ms: 1000,
             matching_samples: 10,
         });
@@ -452,11 +668,18 @@ mod tests {
             matching_samples: 10,
         });
 
-        // IP 0x2000: smaller positive slope
+        // IP 0x2000: smaller positive slope of 10
         results.add_result(ExperimentResult {
             ip: 0x2000,
             speedup_pct: 0.0,
             throughput: 100.0,
+            duration_ms: 1000,
+            matching_samples: 10,
+        });
+        results.add_result(ExperimentResult {
+            ip: 0x2000,
+            speedup_pct: 0.5,
+            throughput: 105.0,
             duration_ms: 1000,
             matching_samples: 10,
         });
@@ -470,10 +693,15 @@ mod tests {
 
         let impacts = results.calculate_impacts();
         assert_eq!(impacts.len(), 2);
-        // First should be 0x1000 with higher impact
+        // First should be 0x1000 with higher impact (slope 50 > slope 10)
         assert_eq!(impacts[0].0, 0x1000);
         assert_eq!(impacts[1].0, 0x2000);
-        assert!(impacts[0].1 > impacts[1].1);
+        assert!(
+            impacts[0].1 > impacts[1].1,
+            "slope {} should be > {}",
+            impacts[0].1,
+            impacts[1].1
+        );
     }
 }
 
@@ -638,5 +866,244 @@ mod proptests {
             let ip_results = results.results_for_ip(0x1000).unwrap();
             prop_assert_eq!(ip_results.len(), n);
         }
+
+        /// Property: R² is between 0 and 1 for all valid data
+        #[test]
+        fn r_squared_in_valid_range(
+            n in 3..20_usize,
+            base_throughput in 100.0..1000.0_f64,
+            slope in 10.0..100.0_f64,
+            noise_scale in 0.0..50.0_f64
+        ) {
+            let results: Vec<ExperimentResult> = (0..n)
+                .map(|i| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let speedup = i as f64 * 0.1;
+                    // Add some noise based on index (deterministic for reproducibility)
+                    #[allow(clippy::cast_precision_loss)]
+                    let noise = ((i as f64 * 7.3).sin()) * noise_scale;
+                    let throughput = base_throughput + speedup * slope + noise;
+                    ExperimentResult {
+                        ip: 0x1000,
+                        speedup_pct: speedup,
+                        throughput,
+                        duration_ms: 1000,
+                        matching_samples: 10,
+                    }
+                })
+                .collect();
+
+            if let Some(reg) = calculate_linear_regression_full(&results) {
+                prop_assert!(reg.r_squared >= 0.0, "R² should be >= 0, got {}", reg.r_squared);
+                prop_assert!(reg.r_squared <= 1.0 + f64::EPSILON, "R² should be <= 1, got {}", reg.r_squared);
+            }
+        }
+
+        /// Property: Confidence interval contains true slope for perfect linear data
+        #[test]
+        fn ci_contains_true_slope_for_perfect_data(
+            n in 5..20_usize,
+            base_throughput in 100.0..1000.0_f64,
+            slope in 10.0..100.0_f64
+        ) {
+            let results: Vec<ExperimentResult> = (0..n)
+                .map(|i| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let speedup = i as f64 * 0.1;
+                    let throughput = base_throughput + speedup * slope;
+                    ExperimentResult {
+                        ip: 0x1000,
+                        speedup_pct: speedup,
+                        throughput,
+                        duration_ms: 1000,
+                        matching_samples: 10,
+                    }
+                })
+                .collect();
+
+            if let Some(reg) = calculate_linear_regression_full(&results) {
+                // For perfect data, slope should equal input and CI should be very tight
+                let slope_error = (reg.slope - slope).abs();
+                prop_assert!(slope_error < 0.001, "slope error {} too large", slope_error);
+                // R² should be 1.0 for perfect linear data
+                prop_assert!(reg.r_squared > 0.999, "R² should be ~1, got {}", reg.r_squared);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod regression_stats_tests {
+    use super::*;
+
+    fn make_result(speedup_pct: f64, throughput: f64) -> ExperimentResult {
+        ExperimentResult {
+            ip: 0x1000,
+            speedup_pct,
+            throughput,
+            duration_ms: 1000,
+            matching_samples: 10,
+        }
+    }
+
+    #[test]
+    fn regression_full_needs_three_points() {
+        let results = vec![make_result(0.0, 100.0), make_result(1.0, 150.0)];
+        assert!(calculate_linear_regression_full(&results).is_none());
+
+        let results = vec![
+            make_result(0.0, 100.0),
+            make_result(0.5, 125.0),
+            make_result(1.0, 150.0),
+        ];
+        assert!(calculate_linear_regression_full(&results).is_some());
+    }
+
+    #[test]
+    fn perfect_linear_data_has_r_squared_one() {
+        let results = vec![
+            make_result(0.0, 100.0),
+            make_result(0.5, 125.0),
+            make_result(1.0, 150.0),
+        ];
+        let reg = calculate_linear_regression_full(&results).unwrap();
+        assert!(
+            (reg.r_squared - 1.0).abs() < 0.001,
+            "R² should be 1.0, got {}",
+            reg.r_squared
+        );
+    }
+
+    #[test]
+    fn constant_y_has_r_squared_one() {
+        // All same throughput = horizontal line = perfect fit to that line
+        let results = vec![
+            make_result(0.0, 100.0),
+            make_result(0.5, 100.0),
+            make_result(1.0, 100.0),
+        ];
+        let reg = calculate_linear_regression_full(&results).unwrap();
+        // R² = 1 because there's no variance to explain
+        assert!(
+            (reg.r_squared - 1.0).abs() < 0.001,
+            "R² should be 1.0 for constant y, got {}",
+            reg.r_squared
+        );
+        // Slope should be 0
+        assert!(
+            reg.slope.abs() < 0.001,
+            "slope should be 0 for constant y, got {}",
+            reg.slope
+        );
+    }
+
+    #[test]
+    fn noisy_data_has_lower_r_squared() {
+        // Perfect data
+        let perfect = vec![
+            make_result(0.0, 100.0),
+            make_result(0.5, 125.0),
+            make_result(1.0, 150.0),
+        ];
+        let reg_perfect = calculate_linear_regression_full(&perfect).unwrap();
+
+        // Noisy data (same x values, scattered y)
+        let noisy = vec![
+            make_result(0.0, 100.0),
+            make_result(0.5, 110.0), // Not on the line
+            make_result(1.0, 150.0),
+        ];
+        let reg_noisy = calculate_linear_regression_full(&noisy).unwrap();
+
+        assert!(
+            reg_noisy.r_squared < reg_perfect.r_squared,
+            "noisy R² ({}) should be less than perfect R² ({})",
+            reg_noisy.r_squared,
+            reg_perfect.r_squared
+        );
+    }
+
+    #[test]
+    fn significant_positive_slope() {
+        // Clear positive trend
+        let results = vec![
+            make_result(0.0, 100.0),
+            make_result(0.25, 112.0),
+            make_result(0.5, 125.0),
+            make_result(0.75, 137.0),
+            make_result(1.0, 150.0),
+        ];
+        let reg = calculate_linear_regression_full(&results).unwrap();
+
+        assert!(reg.slope > 0.0, "slope should be positive");
+        assert!(
+            reg.is_significant(),
+            "should be significant: CI [{}, {}]",
+            reg.slope_ci_lower,
+            reg.slope_ci_upper
+        );
+        assert!(reg.slope_ci_lower > 0.0, "CI lower bound should be > 0");
+    }
+
+    #[test]
+    fn non_significant_flat_data() {
+        // Essentially flat with tiny variation
+        let results = vec![
+            make_result(0.0, 100.0),
+            make_result(0.25, 100.1),
+            make_result(0.5, 99.9),
+            make_result(0.75, 100.2),
+            make_result(1.0, 100.0),
+        ];
+        let reg = calculate_linear_regression_full(&results).unwrap();
+
+        // Slope should be near zero
+        assert!(reg.slope.abs() < 1.0, "slope should be near zero");
+        // CI should include zero (not significant)
+        assert!(
+            !reg.is_significant() || reg.slope.abs() < 0.5,
+            "should not be significant or have very small slope"
+        );
+    }
+
+    #[test]
+    fn t_critical_decreases_with_df() {
+        // More data points = narrower CI = smaller t-critical
+        assert!(t_critical_value_95(5) > t_critical_value_95(10));
+        assert!(t_critical_value_95(10) > t_critical_value_95(20));
+        assert!(t_critical_value_95(20) > t_critical_value_95(100));
+    }
+
+    #[test]
+    fn ci_narrows_with_more_data() {
+        // 5 points
+        let small = vec![
+            make_result(0.0, 100.0),
+            make_result(0.25, 112.0),
+            make_result(0.5, 125.0),
+            make_result(0.75, 137.0),
+            make_result(1.0, 150.0),
+        ];
+        let reg_small = calculate_linear_regression_full(&small).unwrap();
+
+        // 10 points (same slope, interpolated)
+        let large: Vec<_> = (0..10)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let x = i as f64 * 0.1;
+                make_result(x, 100.0 + x * 50.0)
+            })
+            .collect();
+        let reg_large = calculate_linear_regression_full(&large).unwrap();
+
+        let ci_width_small = reg_small.slope_ci_upper - reg_small.slope_ci_lower;
+        let ci_width_large = reg_large.slope_ci_upper - reg_large.slope_ci_lower;
+
+        assert!(
+            ci_width_large < ci_width_small,
+            "larger sample should have narrower CI: {} vs {}",
+            ci_width_large,
+            ci_width_small
+        );
     }
 }

@@ -81,12 +81,12 @@ impl TestProgress {
 #[test]
 fn throughput_matches_known_rate() {
     let progress = TestProgress::new();
-    let target_ops_per_sec = 1000.0;
+    let target_ops_per_sec = 500.0; // Lower rate for more stable measurements
     let delay_per_op = Duration::from_secs_f64(1.0 / target_ops_per_sec);
-    let iterations = 100;
+    let iterations = 200; // More iterations for statistical stability
 
-    // Warm up
-    for _ in 0..10 {
+    // Warm up - longer warmup for more stable timing
+    for _ in 0..20 {
         progress.note_visit();
         std::thread::sleep(delay_per_op);
     }
@@ -103,10 +103,10 @@ fn throughput_matches_known_rate() {
     let measured_throughput = progress.throughput();
     let expected_throughput = f64::from(iterations - 1) / elapsed.as_secs_f64();
 
-    // Throughput should be within 20% of expected (accounting for timing jitter)
+    // Throughput should be within 10% of expected (tighter tolerance with more samples)
     let relative_error = ((measured_throughput - expected_throughput) / expected_throughput).abs();
     assert!(
-        relative_error < 0.2,
+        relative_error < 0.1,
         "Throughput error too high: measured={measured_throughput:.2}, expected={expected_throughput:.2}, error={:.1}%",
         relative_error * 100.0
     );
@@ -222,12 +222,13 @@ fn reset_clears_state_completely() {
 /// consistent results (low variance).
 #[test]
 fn throughput_is_stable() {
-    let measurements: Vec<f64> = (0..5)
+    let measurements: Vec<f64> = (0..10) // More measurements for better statistics
         .map(|_| {
             let progress = TestProgress::new();
             let delay = Duration::from_millis(5);
 
-            for _ in 0..50 {
+            for _ in 0..100 {
+                // More iterations per measurement
                 progress.note_visit();
                 std::thread::sleep(delay);
             }
@@ -243,7 +244,7 @@ fn throughput_is_stable() {
     let cv = stddev / mean; // Coefficient of variation
 
     assert!(
-        cv < 0.15,
+        cv < 0.10, // Tighter tolerance with more samples
         "Throughput too variable: mean={mean:.2}, stddev={stddev:.2}, CV={cv:.2}"
     );
 }

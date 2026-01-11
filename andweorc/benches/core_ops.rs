@@ -198,6 +198,227 @@ fn bench_thread_local(c: &mut Criterion) {
     });
 }
 
+/// Benchmark progress point visit overhead.
+///
+/// This measures the full cost of a progress point increment, which includes:
+/// - Atomic counter increment
+/// - Clock_gettime for first/last timestamp tracking
+fn bench_progress_point_overhead(c: &mut Criterion) {
+    // Simulate progress point state
+    struct SimulatedProgress {
+        visits: AtomicU64,
+        first_visit_ns: AtomicU64,
+        last_visit_ns: AtomicU64,
+    }
+
+    impl SimulatedProgress {
+        fn new() -> Self {
+            Self {
+                visits: AtomicU64::new(0),
+                first_visit_ns: AtomicU64::new(0),
+                last_visit_ns: AtomicU64::new(0),
+            }
+        }
+
+        fn visit(&self) {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            unsafe {
+                libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts);
+            }
+            let now = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+
+            self.visits.fetch_add(1, Ordering::Release);
+            let _ =
+                self.first_visit_ns
+                    .compare_exchange(0, now, Ordering::Release, Ordering::Relaxed);
+            self.last_visit_ns.store(now, Ordering::Release);
+        }
+    }
+
+    let progress = SimulatedProgress::new();
+
+    c.bench_function("progress_point_visit", |b| b.iter(|| progress.visit()));
+}
+
+/// Benchmark sample counting overhead (SampleEntry increment).
+///
+/// This measures the cost of the lock-free hash table increment that
+/// happens on every sample in the signal handler.
+fn bench_sample_increment_overhead(c: &mut Criterion) {
+    use std::sync::atomic::AtomicUsize;
+
+    const BUCKETS: usize = 8192;
+
+    struct SampleEntry {
+        ip: AtomicUsize,
+        count: AtomicU64,
+    }
+
+    impl SampleEntry {
+        const fn new() -> Self {
+            Self {
+                ip: AtomicUsize::new(0),
+                count: AtomicU64::new(0),
+            }
+        }
+    }
+
+    // Simplified hash
+    fn hash(ip: usize) -> usize {
+        const FNV_OFFSET: usize = 0xcbf2_9ce4_8422_2325_usize;
+        const FNV_PRIME: usize = 0x0100_0000_01b3_usize;
+        let mut h = FNV_OFFSET;
+        for i in 0..std::mem::size_of::<usize>() {
+            h ^= (ip >> (i * 8)) & 0xFF;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h & (BUCKETS - 1)
+    }
+
+    // Create a sample counter
+    let entries: Vec<SampleEntry> = (0..BUCKETS).map(|_| SampleEntry::new()).collect();
+
+    // Pre-populate with a known IP to test the "found existing" fast path
+    let known_ip = 0xDEAD_BEEF_usize;
+    let idx = hash(known_ip);
+    entries[idx].ip.store(known_ip, Ordering::Relaxed);
+
+    c.bench_function("sample_increment_existing", |b| {
+        b.iter(|| {
+            let ip = black_box(known_ip);
+            let start = hash(ip);
+            for i in 0..BUCKETS {
+                let idx = (start + i) & (BUCKETS - 1);
+                let current = entries[idx].ip.load(Ordering::Relaxed);
+                if current == ip {
+                    entries[idx].count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        })
+    });
+
+    // Test the "claim new slot" path
+    let new_ip = 0xCAFE_BABE_usize;
+    c.bench_function("sample_increment_new", |b| {
+        b.iter(|| {
+            let ip = black_box(new_ip);
+            let start = hash(ip);
+            for i in 0..BUCKETS {
+                let idx = (start + i) & (BUCKETS - 1);
+                let current = entries[idx].ip.load(Ordering::Relaxed);
+                if current == ip {
+                    entries[idx].count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                if current == 0 {
+                    match entries[idx].ip.compare_exchange(
+                        0,
+                        ip,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            entries[idx].count.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Err(actual) if actual == ip => {
+                            entries[idx].count.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        })
+    });
+}
+
+/// Benchmark combined profiler overhead per sample.
+///
+/// This estimates the total overhead the profiler adds when a sample is taken:
+/// - Hash calculation
+/// - Sample table increment
+/// - TLS access pattern
+fn bench_combined_sample_overhead(c: &mut Criterion) {
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+
+    const BUCKETS: usize = 8192;
+
+    struct SampleEntry {
+        ip: AtomicUsize,
+        count: AtomicU64,
+    }
+
+    thread_local! {
+        static PROFILER_STATE: RefCell<u64> = const { RefCell::new(0) };
+    }
+
+    // Simulate the full sample processing path
+    let entries: Vec<SampleEntry> = (0..BUCKETS)
+        .map(|_| SampleEntry {
+            ip: AtomicUsize::new(0),
+            count: AtomicU64::new(0),
+        })
+        .collect();
+
+    // Pre-populate some IPs
+    for i in 0..100 {
+        let ip = 0x1000_0000 + i * 0x1000;
+        let idx = {
+            const FNV_OFFSET: usize = 0xcbf2_9ce4_8422_2325_usize;
+            const FNV_PRIME: usize = 0x0100_0000_01b3_usize;
+            let mut h = FNV_OFFSET;
+            for j in 0..std::mem::size_of::<usize>() {
+                h ^= (ip >> (j * 8)) & 0xFF;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            h & (BUCKETS - 1)
+        };
+        entries[idx].ip.store(ip, Ordering::Relaxed);
+    }
+
+    c.bench_function("combined_sample_overhead", |b| {
+        let mut ip_counter = 0_usize;
+        b.iter(|| {
+            // Simulate getting an IP from a sample (cycle through known IPs)
+            let ip = 0x1000_0000 + (ip_counter % 100) * 0x1000;
+            ip_counter += 1;
+
+            // Hash the IP
+            let start = {
+                const FNV_OFFSET: usize = 0xcbf2_9ce4_8422_2325_usize;
+                const FNV_PRIME: usize = 0x0100_0000_01b3_usize;
+                let mut h = FNV_OFFSET;
+                for i in 0..std::mem::size_of::<usize>() {
+                    h ^= (ip >> (i * 8)) & 0xFF;
+                    h = h.wrapping_mul(FNV_PRIME);
+                }
+                h & (BUCKETS - 1)
+            };
+
+            // Increment sample count (lock-free)
+            for i in 0..BUCKETS {
+                let idx = (start + i) & (BUCKETS - 1);
+                let current = entries[idx].ip.load(Ordering::Relaxed);
+                if current == ip {
+                    entries[idx].count.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            // TLS access (simulating per-thread state check)
+            PROFILER_STATE.with(|state| {
+                *state.borrow_mut() += 1;
+            });
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_hash,
@@ -207,6 +428,9 @@ criterion_group!(
     bench_delay_lookup,
     bench_nanosleep,
     bench_thread_local,
+    bench_progress_point_overhead,
+    bench_sample_increment_overhead,
+    bench_combined_sample_overhead,
 );
 
 criterion_main!(benches);

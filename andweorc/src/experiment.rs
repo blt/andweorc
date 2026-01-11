@@ -19,12 +19,33 @@ use crate::progress_point::Progress;
 use libc::{c_int, c_void};
 use nix::errno::Errno;
 use nix::sys::signal::{signal, SigHandler, Signal};
-use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
+
+/// Helper to recover from a poisoned read lock.
+///
+/// For profiling data, we recover the guard and continue since losing
+/// all progress point data is worse than having potentially-incomplete data.
+fn recover_read<'a, T>(
+    result: Result<RwLockReadGuard<'a, T>, PoisonError<RwLockReadGuard<'a, T>>>,
+) -> RwLockReadGuard<'a, T> {
+    result.unwrap_or_else(|poison| {
+        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
+        poison.into_inner()
+    })
+}
+
+/// Helper to recover from a poisoned write lock.
+fn recover_write<'a, T>(
+    result: Result<RwLockWriteGuard<'a, T>, PoisonError<RwLockWriteGuard<'a, T>>>,
+) -> RwLockWriteGuard<'a, T> {
+    result.unwrap_or_else(|poison| {
+        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
+        poison.into_inner()
+    })
+}
 
 /// Percentage multipliers for the delay table.
 ///
@@ -50,49 +71,6 @@ const DELAY_BASELINE: Duration = Duration::from_millis(10);
 /// Number of buckets for the sample count hash table.
 /// Must be a power of 2 for efficient modulo via bitwise AND.
 const SAMPLE_COUNT_BUCKETS: usize = 8192;
-
-/// Gets a random seed from the system entropy source.
-///
-/// Uses `/dev/urandom` on Linux for high-quality entropy without blocking.
-/// Falls back to a combination of process ID and high-resolution timestamp
-/// if the entropy source is unavailable.
-fn get_random_seed() -> u64 {
-    // Try to read from /dev/urandom
-    let mut buf = [0u8; 8];
-    // SAFETY: We're reading from a special file that provides random bytes.
-    // This is safe and the file always exists on Linux.
-    let result = unsafe {
-        let fd = libc::open(c"/dev/urandom".as_ptr(), libc::O_RDONLY);
-        if fd >= 0 {
-            let bytes_read = libc::read(fd, buf.as_mut_ptr().cast(), 8);
-            libc::close(fd);
-            bytes_read == 8
-        } else {
-            false
-        }
-    };
-
-    if result {
-        u64::from_ne_bytes(buf)
-    } else {
-        // Fallback: combine PID and high-resolution time for reasonable entropy
-        // Allow sign loss: PID is always positive on Linux
-        #[allow(clippy::cast_sign_loss)]
-        let pid = unsafe { libc::getpid() as u64 };
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        unsafe {
-            libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts);
-        }
-        #[allow(clippy::cast_sign_loss)]
-        let time_component = (ts.tv_sec as u64)
-            .wrapping_mul(1_000_000_000)
-            .wrapping_add(ts.tv_nsec as u64);
-        pid.wrapping_mul(0x517c_c1b7_2722_0a95) ^ time_component
-    }
-}
 
 /// Flag indicating whether the experiment singleton is fully initialized.
 /// This is used by the signal handler to avoid accessing uninitialized data.
@@ -243,6 +221,28 @@ pub(crate) fn get_instance() -> &'static Experiment {
     }
 }
 
+/// A single sample entry containing an IP and its count.
+///
+/// IP and count are stored together to ensure they share a cache line,
+/// avoiding false sharing when different threads access different entries.
+#[repr(C)]
+struct SampleEntry {
+    /// Instruction pointer (0 = empty slot)
+    ip: AtomicUsize,
+    /// Number of times this IP was sampled
+    count: AtomicU64,
+}
+
+impl SampleEntry {
+    /// Creates a new empty sample entry.
+    const fn new() -> Self {
+        Self {
+            ip: AtomicUsize::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Lock-free sample counter using open addressing with linear probing.
 ///
 /// This data structure is designed for use in signal handlers where
@@ -250,10 +250,11 @@ pub(crate) fn get_instance() -> &'static Experiment {
 ///
 /// # Design
 ///
-/// - Fixed-size array of (IP, count) pairs
+/// - Fixed-size array of interleaved (IP, count) entries
 /// - Uses linear probing for collision resolution
 /// - IPs are stored as `AtomicUsize`, counts as `AtomicU64`
 /// - An IP of 0 indicates an empty slot
+/// - IP and count are colocated to avoid false sharing
 ///
 /// # Limitations
 ///
@@ -261,10 +262,8 @@ pub(crate) fn get_instance() -> &'static Experiment {
 /// - Once a slot is used, it's never freed (acceptable for profiling)
 /// - Hash collisions may cause some IPs to be missed if table is full
 struct SampleCounts {
-    /// Instruction pointers (0 = empty slot)
-    ips: Box<[AtomicUsize; SAMPLE_COUNT_BUCKETS]>,
-    /// Corresponding counts
-    counts: Box<[AtomicU64; SAMPLE_COUNT_BUCKETS]>,
+    /// Interleaved IP/count entries for cache efficiency
+    entries: Box<[SampleEntry; SAMPLE_COUNT_BUCKETS]>,
 }
 
 impl std::fmt::Debug for SampleCounts {
@@ -278,11 +277,10 @@ impl std::fmt::Debug for SampleCounts {
 impl SampleCounts {
     /// Creates a new empty sample counter.
     fn new() -> Self {
-        // Initialize arrays with zeros
+        // Initialize entries array with empty entries
         // Using Box to avoid stack overflow with large arrays
-        let ips = Box::new(std::array::from_fn(|_| AtomicUsize::new(0)));
-        let counts = Box::new(std::array::from_fn(|_| AtomicU64::new(0)));
-        Self { ips, counts }
+        let entries = Box::new(std::array::from_fn(|_| SampleEntry::new()));
+        Self { entries }
     }
 
     /// Hashes an IP address to a bucket index.
@@ -328,28 +326,32 @@ impl SampleCounts {
         // Linear probing with a maximum of SAMPLE_COUNT_BUCKETS attempts
         for i in 0..SAMPLE_COUNT_BUCKETS {
             let idx = (start + i) & (SAMPLE_COUNT_BUCKETS - 1);
+            let entry = &self.entries[idx];
 
-            let current = self.ips[idx].load(Ordering::Relaxed);
+            let current = entry.ip.load(Ordering::Relaxed);
 
             if current == ip {
                 // Found existing entry, increment count
-                self.counts[idx].fetch_add(1, Ordering::Relaxed);
+                entry.count.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
             if current == 0 {
                 // Empty slot - try to claim it
                 // Use Release on success to publish the IP to readers
-                match self.ips[idx].compare_exchange(0, ip, Ordering::Release, Ordering::Relaxed) {
+                match entry
+                    .ip
+                    .compare_exchange(0, ip, Ordering::Release, Ordering::Relaxed)
+                {
                     Ok(_) => {
                         // Successfully claimed the slot
-                        self.counts[idx].fetch_add(1, Ordering::Relaxed);
+                        entry.count.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                     Err(actual) => {
                         if actual == ip {
                             // Another thread/signal just inserted this IP
-                            self.counts[idx].fetch_add(1, Ordering::Relaxed);
+                            entry.count.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
                         // Someone else claimed it with a different IP, continue probing
@@ -370,12 +372,12 @@ impl SampleCounts {
     /// Call this only after all profiling threads have stopped.
     fn entries(&self) -> Vec<(usize, u64)> {
         let mut result = Vec::new();
-        for i in 0..SAMPLE_COUNT_BUCKETS {
+        for entry in self.entries.iter() {
             // Acquire synchronizes with Release in increment() when slot was claimed
-            let ip = self.ips[i].load(Ordering::Acquire);
+            let ip = entry.ip.load(Ordering::Acquire);
             if ip != 0 {
                 // Acquire to see all count updates
-                let count = self.counts[i].load(Ordering::Acquire);
+                let count = entry.count.load(Ordering::Acquire);
                 if count > 0 {
                     result.push((ip, count));
                 }
@@ -415,10 +417,6 @@ pub struct Experiment {
     /// Read-only after initialization.
     delay_table: Vec<Duration>,
 
-    /// Random number generator for experiment scheduling.
-    #[allow(dead_code)]
-    rng: SmallRng,
-
     /// Total number of delays issued across all threads.
     /// Incremented when the selected line is sampled.
     global_delay_count: AtomicU32,
@@ -455,27 +453,11 @@ impl std::fmt::Debug for Experiment {
     }
 }
 
-/// Information about the current delay configuration.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DelayDetails {
-    /// The global delay count at the time of query.
-    pub global_delay: u32,
-    /// The current delay duration to apply.
-    pub current_delay: Duration,
-}
-
 /// Statistics about the current experiment.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExperimentStats {
-    /// Total samples collected.
-    pub total_samples: u64,
     /// Samples matching the selected IP.
     pub selected_samples: u64,
-    /// Whether an experiment is active.
-    pub is_active: bool,
-    /// Current speedup percentage index.
-    pub speedup_index: usize,
 }
 
 impl Experiment {
@@ -493,9 +475,6 @@ impl Experiment {
         let previous_handler = unsafe { signal(Signal::SIGPROF, handler) }
             .map_err(ExperimentInitError::SignalHandlerRegistration)?;
 
-        // Seed RNG from system entropy source for non-deterministic experiment scheduling
-        let rng_seed = get_random_seed();
-
         Ok(Self {
             previous_handler,
             progress_points: RwLock::new(HashMap::new()),
@@ -506,7 +485,6 @@ impl Experiment {
             total_samples: AtomicU64::new(0),
             selected_samples: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
-            rng: SmallRng::seed_from_u64(rng_seed),
             delay_table: DELAY_PRCNT
                 .iter()
                 .map(|prct| delay_baseline.mul_f64(*prct))
@@ -514,43 +492,10 @@ impl Experiment {
         })
     }
 
-    /// Returns the current delay configuration.
-    ///
-    /// Uses safe bounds checking to prevent panics even if the delay index
-    /// is somehow out of bounds (which would indicate a bug). Returns zero
-    /// delay if the delay table is empty or index is invalid.
-    ///
-    /// # Signal Safety
-    ///
-    /// This function is async-signal-safe: it only uses atomic loads and
-    /// array indexing on a pre-allocated, read-only table.
-    pub(crate) fn delay_details(&self) -> DelayDetails {
-        let global_delay = self.global_delay_count.load(Ordering::Relaxed);
-        let index = self.delay_index.load(Ordering::Relaxed);
-
-        // Use safe index access to prevent panic in signal handler context
-        // Falls back to zero delay if table is empty or index invalid
-        let current_delay = self
-            .delay_table
-            .get(index)
-            .or_else(|| self.delay_table.last())
-            .copied()
-            .unwrap_or(Duration::ZERO);
-
-        DelayDetails {
-            global_delay,
-            current_delay,
-        }
-    }
-
     /// Returns statistics about the current experiment.
-    #[allow(dead_code)]
     pub(crate) fn stats(&self) -> ExperimentStats {
         ExperimentStats {
-            total_samples: self.total_samples.load(Ordering::Relaxed),
             selected_samples: self.selected_samples.load(Ordering::Relaxed),
-            is_active: self.is_active.load(Ordering::Relaxed),
-            speedup_index: self.delay_index.load(Ordering::Relaxed),
         }
     }
 
@@ -561,7 +506,6 @@ impl Experiment {
     /// * `ip` - The instruction pointer to virtually speed up.
     /// * `speedup_index` - Index into the delay table for speedup percentage.
     ///   If out of bounds, it will be clamped to the maximum valid index.
-    #[allow(dead_code)]
     pub(crate) fn start_experiment(&self, ip: *const c_void, speedup_index: usize) {
         // Reset counters
         self.total_samples.store(0, Ordering::Relaxed);
@@ -578,7 +522,6 @@ impl Experiment {
     }
 
     /// Stops the current experiment round.
-    #[allow(dead_code)]
     pub(crate) fn stop_experiment(&self) {
         self.is_active.store(false, Ordering::Release);
         self.selected_ip
@@ -588,29 +531,17 @@ impl Experiment {
     /// Returns the progress point with the given name, creating one if necessary.
     ///
     /// This function acquires a lock and should NOT be called from signal handlers.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `progress_points` lock is poisoned. This can only occur if
-    /// another thread panicked while holding the lock, which indicates a bug.
-    #[allow(clippy::expect_used)]
     pub(crate) fn progress(&self, name: &'static str) -> Arc<Progress> {
         // Fast path: check if it exists with a read lock
         {
-            let read_guard = self
-                .progress_points
-                .read()
-                .expect("progress_points lock poisoned");
+            let read_guard = recover_read(self.progress_points.read());
             if let Some(progress) = read_guard.get(name) {
                 return Arc::clone(progress);
             }
         }
 
         // Slow path: acquire write lock and insert
-        let mut write_guard = self
-            .progress_points
-            .write()
-            .expect("progress_points lock poisoned");
+        let mut write_guard = recover_write(self.progress_points.write());
 
         // Double-check after acquiring write lock
         if let Some(progress) = write_guard.get(name) {
