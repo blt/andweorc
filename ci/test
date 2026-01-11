@@ -18,6 +18,8 @@ fi
 echo "Running cargo nextest..."
 echo "  PROPTEST_CASES=${PROPTEST_CASES}"
 echo "  PROPTEST_MAX_SHRINK_ITERS=${PROPTEST_MAX_SHRINK_ITERS}"
-cargo nextest run --workspace --all-features "$@"
+# Exclude andweorc-macros: proc-macro crates have no unit tests and nextest
+# has issues running their test binaries due to shared library linking
+cargo nextest run --workspace --all-features --exclude andweorc-macros "$@"
 
 echo "Tests passed!"

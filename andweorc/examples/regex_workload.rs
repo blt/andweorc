@@ -41,47 +41,45 @@ impl LogParser {
     fn new() -> Self {
         Self {
             // Timestamp pattern: 2024-01-15T10:30:45.123Z
-            timestamp_re: Regex::new(
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?"
-            ).unwrap(),
+            timestamp_re: Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?").unwrap(),
             // Log level: INFO, WARN, ERROR, DEBUG
             level_re: Regex::new(r"\b(INFO|WARN|ERROR|DEBUG|TRACE)\b").unwrap(),
             // IP addresses (both IPv4 and simple patterns)
-            ip_re: Regex::new(
-                r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
-            ).unwrap(),
+            ip_re: Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").unwrap(),
             // URLs - this is the expensive pattern
-            url_re: Regex::new(
-                r"https?://[^\s<>\"\']+"
-            ).unwrap(),
+            url_re: Regex::new(r#"https?://[^\s<>"']+"#).unwrap(),
         }
     }
 
     /// Parse a single log line - extract all patterns.
     fn parse_line(&self, line: &str) -> LogEntry {
         // Extract timestamp - usually fast
-        let timestamp = self.timestamp_re
+        let timestamp = self
+            .timestamp_re
             .find(line)
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
         progress!("parse_timestamp");
 
         // Extract log level - very fast
-        let level = self.level_re
+        let level = self
+            .level_re
             .find(line)
             .map(|m| m.as_str().to_string())
             .unwrap_or_else(|| "UNKNOWN".to_string());
         progress!("parse_level");
 
         // Extract all IP addresses - can be slow with many matches
-        let ip_addresses: Vec<String> = self.ip_re
+        let ip_addresses: Vec<String> = self
+            .ip_re
             .find_iter(line)
             .map(|m| m.as_str().to_string())
             .collect();
         progress!("parse_ips");
 
         // Extract URLs - this is often the bottleneck
-        let urls: Vec<String> = self.url_re
+        let urls: Vec<String> = self
+            .url_re
             .find_iter(line)
             .map(|m| m.as_str().to_string())
             .collect();
@@ -116,23 +114,23 @@ fn generate_log_lines(count: usize) -> Vec<String> {
         let line = match i % 5 {
             0 => format!(
                 "2024-01-15T{:02}:{:02}:45.123Z {} Simple message from 192.168.{}.{}",
-                hour, minute, ip1, ip2
+                hour, minute, level, ip1, ip2
             ),
             1 => format!(
                 "2024-01-15T{:02}:{:02}:45.123Z {} Request from 10.0.{}.{} to https://api.example.com/v1/users",
-                hour, minute, ip1, ip2
+                hour, minute, level, ip1, ip2
             ),
             2 => format!(
                 "2024-01-15T{:02}:{:02}:45.123Z {} Connection 172.16.{}.{} -> 192.168.{}.{} via https://proxy.internal.net/forward",
-                hour, minute, ip1, ip2, ip2, ip1
+                hour, minute, level, ip1, ip2, ip2, ip1
             ),
             3 => format!(
                 "2024-01-15T{:02}:{:02}:45.123Z {} External API call to https://api.github.com/repos/rust-lang/rust/pulls from client 8.8.{}.{}",
-                hour, minute, ip1, ip2
+                hour, minute, level, ip1, ip2
             ),
             _ => format!(
                 "2024-01-15T{:02}:{:02}:45.123Z {} Multi-hop: 10.0.{}.{} -> 172.16.{}.{} -> 192.168.{}.{} URLs: https://service-a.local/api https://service-b.local/api https://external.com/callback",
-                hour, minute, ip1, ip2, ip2, ip1, ip1, ip2
+                hour, minute, level, ip1, ip2, ip2, ip1, ip1, ip2
             ),
         };
         lines.push(line);

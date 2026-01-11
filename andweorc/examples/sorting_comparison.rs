@@ -75,7 +75,8 @@ fn generate_data(size: usize, seed: u64) -> Vec<i32> {
     let mut state = seed;
     for _ in 0..size {
         // Simple LCG for deterministic "random" numbers
-        state = state.wrapping_mul(6_364_136_223_846_793_005)
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         #[allow(clippy::cast_possible_truncation)]
         data.push((state >> 33) as i32);
@@ -96,7 +97,7 @@ fn main() {
     println!("bubble sort (O(n^2)) vs quicksort (O(n log n)).");
     println!();
 
-    let bubble_size = 500;   // Small array for bubble sort (it's slow!)
+    let bubble_size = 500; // Small array for bubble sort (it's slow!)
     let quick_size = 10_000; // Larger array for quicksort
 
     // Phase 1: Warmup to collect samples
@@ -115,7 +116,10 @@ fn main() {
     }
 
     let warmup_elapsed = start.elapsed();
-    println!("Warmup: {} iterations in {:?}", warmup_iterations, warmup_elapsed);
+    println!(
+        "Warmup: {} iterations in {:?}",
+        warmup_iterations, warmup_elapsed
+    );
     println!();
 
     // Phase 2: Run experiments with a worker thread doing the actual work

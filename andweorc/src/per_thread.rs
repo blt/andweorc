@@ -57,20 +57,14 @@ impl PerThreadProfiler {
             Ok(s) => {
                 // Enable the perf event to start collecting samples
                 if let Err(e) = s.enable() {
-                    libc_print::libc_eprintln!(
-                        "[andweorc] failed to enable perf sampling: {}",
-                        e
-                    );
+                    libc_print::libc_eprintln!("[andweorc] failed to enable perf sampling: {}", e);
                     None
                 } else {
                     Some(s)
                 }
             }
             Err(e) => {
-                libc_print::libc_eprintln!(
-                    "[andweorc] perf sampling not available: {}",
-                    e
-                );
+                libc_print::libc_eprintln!("[andweorc] perf sampling not available: {}", e);
                 libc_print::libc_eprintln!(
                     "[andweorc] Try: sudo sysctl kernel.perf_event_paranoid=-1"
                 );

@@ -187,9 +187,10 @@ fn run_profiler(args: &RunArgs) -> Result<()> {
 
     // Step 5: Write results
     let report = ProfileReport {
-        binary: binary_path
-            .file_name()
-            .map_or_else(|| "unknown".to_string(), |n| n.to_string_lossy().to_string()),
+        binary: binary_path.file_name().map_or_else(
+            || "unknown".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        ),
         duration_secs: results
             .iter()
             .map(|r| f64::from(u32::try_from(r.duration_ms).unwrap_or(u32::MAX)) / 1000.0)
@@ -431,7 +432,9 @@ fn resolve_symbols(
 }
 
 /// Calculates causal impacts from resolved experiment results.
-fn calculate_impacts(resolved: &HashMap<SourceLocation, Vec<ExperimentResult>>) -> Vec<CausalImpact> {
+fn calculate_impacts(
+    resolved: &HashMap<SourceLocation, Vec<ExperimentResult>>,
+) -> Vec<CausalImpact> {
     let mut impacts: Vec<CausalImpact> = resolved
         .iter()
         .filter_map(|(location, results)| {
@@ -530,7 +533,9 @@ fn generate_report(args: &ReportArgs) -> Result<()> {
             println!("{json}");
         }
         "csv" => {
-            println!("file,line,impact,experiment_count,baseline_throughput,predicted_max_throughput");
+            println!(
+                "file,line,impact,experiment_count,baseline_throughput,predicted_max_throughput"
+            );
             for impact in &report.impacts {
                 println!(
                     "{},{},{},{},{},{}",

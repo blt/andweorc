@@ -113,7 +113,10 @@ fn main() {
     // Phase 2: Run experiments with multiple worker threads
     // Testing multi-threaded profiling with SIGPROF blocking fix
     let num_workers = 4;
-    println!("\nPhase 2: Running causal profiling experiments with {} workers...", num_workers);
+    println!(
+        "\nPhase 2: Running causal profiling experiments with {} workers...",
+        num_workers
+    );
 
     let running = Arc::new(AtomicBool::new(true));
     let experiment_counter = Arc::new(SharedCounter::new());
@@ -148,5 +151,8 @@ fn main() {
         println!("Worker {} completed {} iterations", i, iters);
         total_iterations += iters;
     }
-    println!("Total: {} iterations across {} workers", total_iterations, num_workers);
+    println!(
+        "Total: {} iterations across {} workers",
+        total_iterations, num_workers
+    );
 }

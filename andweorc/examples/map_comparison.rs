@@ -110,7 +110,10 @@ fn main() {
 
     // Test 1: Random lookups
     println!();
-    println!("Test 1: Random Lookups ({} lookups x {} iterations)", lookup_count, iterations);
+    println!(
+        "Test 1: Random Lookups ({} lookups x {} iterations)",
+        lookup_count, iterations
+    );
 
     let start = Instant::now();
     let mut total_found = 0;
@@ -138,7 +141,10 @@ fn main() {
 
     // Test 2: Range queries
     println!();
-    println!("Test 2: Range Queries (10% range x {} iterations)", iterations);
+    println!(
+        "Test 2: Range Queries (10% range x {} iterations)",
+        iterations
+    );
 
     let range_start = (map_size as u64) / 4;
     let range_end = range_start + (map_size as u64) / 10;
