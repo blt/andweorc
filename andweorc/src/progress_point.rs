@@ -19,15 +19,27 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Gets the current monotonic time in nanoseconds.
+///
+/// # Returns
+///
+/// The current monotonic time in nanoseconds, or 0 if `clock_gettime` fails.
+/// Failure should only occur due to programmer error (invalid `clock_id`),
+/// not at runtime, so returning 0 is a reasonable fallback.
 fn monotonic_nanos() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: clock_gettime with CLOCK_MONOTONIC is async-signal-safe
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts);
+    // SAFETY: clock_gettime with CLOCK_MONOTONIC is async-signal-safe.
+    // We pass a valid mutable pointer to ts.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+
+    // clock_gettime only fails if the clock_id is invalid, which is a programmer
+    // error. Return 0 as a safe fallback rather than panicking in production.
+    if result != 0 {
+        return 0;
     }
+
     // Convert to nanoseconds
     #[allow(clippy::cast_sign_loss)]
     let nanos = (ts.tv_sec as u64)
@@ -79,6 +91,11 @@ impl Progress {
     /// Returns a shared reference to the progress point with the given name.
     ///
     /// Creates the progress point if it doesn't exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the experiment singleton failed to initialize (e.g., SIGPROF
+    /// signal handler could not be registered).
     #[must_use]
     pub fn get_instance(name: &'static str) -> Arc<Self> {
         crate::experiment::get_instance().progress(name)
@@ -172,4 +189,161 @@ macro_rules! progress {
     ($name:expr) => {
         $crate::progress_point::Progress::get_instance($name).note_visit();
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_progress_has_zero_visits() {
+        let p = Progress::new("test");
+        assert_eq!(p.visit_count(), 0);
+    }
+
+    #[test]
+    fn new_progress_has_zero_elapsed() {
+        let p = Progress::new("test");
+        assert_eq!(p.elapsed_nanos(), 0);
+    }
+
+    #[test]
+    fn new_progress_has_zero_throughput() {
+        let p = Progress::new("test");
+        assert!((p.throughput() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn single_visit_no_throughput() {
+        let p = Progress::new("test");
+        p.note_visit();
+        assert_eq!(p.visit_count(), 1);
+        // Throughput requires at least 2 visits
+        assert!((p.throughput() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn multiple_visits_accumulate() {
+        let p = Progress::new("test");
+        for _ in 0..100 {
+            p.note_visit();
+        }
+        assert_eq!(p.visit_count(), 100);
+    }
+
+    #[test]
+    fn reset_clears_all_state() {
+        let p = Progress::new("test");
+        p.note_visit();
+        p.note_visit();
+        p.reset();
+        assert_eq!(p.visit_count(), 0);
+        assert_eq!(p.elapsed_nanos(), 0);
+        assert!((p.throughput() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn elapsed_nanos_is_non_negative() {
+        let p = Progress::new("test");
+        p.note_visit();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        p.note_visit();
+        // Elapsed should be at least 1ms = 1_000_000 ns
+        assert!(p.elapsed_nanos() >= 1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Test helper: calculate throughput from raw values
+    fn calc_throughput(visits: u32, first_ns: u64, last_ns: u64) -> f64 {
+        if visits < 2 {
+            return 0.0;
+        }
+        if first_ns == 0 || last_ns == 0 || last_ns <= first_ns {
+            return 0.0;
+        }
+        let elapsed_ns = last_ns - first_ns;
+        let visits_f64 = f64::from(visits - 1);
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_secs = elapsed_ns as f64 / 1_000_000_000.0;
+        visits_f64 / elapsed_secs
+    }
+
+    proptest! {
+        /// Property: Throughput is always non-negative
+        #[test]
+        fn throughput_is_non_negative(visits in 0..1000_u32, elapsed_ns in 0..10_000_000_000_u64) {
+            let first_ns = 1_000_000_000_u64; // 1 second
+            let last_ns = first_ns + elapsed_ns;
+            let throughput = calc_throughput(visits, first_ns, last_ns);
+            prop_assert!(throughput >= 0.0, "throughput was {throughput}");
+        }
+
+        /// Property: Zero visits means zero throughput
+        #[test]
+        fn zero_visits_zero_throughput(first_ns in 1..1000_000_000_u64, last_ns in 1..1000_000_000_u64) {
+            let throughput = calc_throughput(0, first_ns, last_ns.max(first_ns + 1));
+            prop_assert!((throughput - 0.0).abs() < f64::EPSILON);
+        }
+
+        /// Property: One visit means zero throughput
+        #[test]
+        fn one_visit_zero_throughput(first_ns in 1..1000_000_000_u64, last_ns in 1..1000_000_000_u64) {
+            let throughput = calc_throughput(1, first_ns, last_ns.max(first_ns + 1));
+            prop_assert!((throughput - 0.0).abs() < f64::EPSILON);
+        }
+
+        /// Property: More visits in same time = higher throughput
+        #[test]
+        fn more_visits_higher_throughput(
+            visits1 in 2..500_u32,
+            visits2 in 501..1000_u32,
+            elapsed_ns in 1_000_000..1_000_000_000_u64  // 1ms to 1s
+        ) {
+            let first_ns = 1_000_000_000_u64;
+            let last_ns = first_ns + elapsed_ns;
+            let t1 = calc_throughput(visits1, first_ns, last_ns);
+            let t2 = calc_throughput(visits2, first_ns, last_ns);
+            prop_assert!(t2 > t1, "t2 ({t2}) should be > t1 ({t1})");
+        }
+
+        /// Property: Same visits in less time = higher throughput
+        #[test]
+        fn less_time_higher_throughput(
+            visits in 10..1000_u32,
+            elapsed1 in 500_000_000..1_000_000_000_u64,  // 0.5s to 1s
+            elapsed2 in 100_000_000..499_999_999_u64,    // 0.1s to 0.5s
+        ) {
+            let first_ns = 1_000_000_000_u64;
+            let t1 = calc_throughput(visits, first_ns, first_ns + elapsed1);
+            let t2 = calc_throughput(visits, first_ns, first_ns + elapsed2);
+            prop_assert!(t2 > t1, "t2 ({t2}) should be > t1 ({t1})");
+        }
+
+        /// Property: Throughput is finite (not NaN or Inf)
+        #[test]
+        fn throughput_is_finite(
+            visits in 2..10000_u32,
+            elapsed_ns in 1..10_000_000_000_u64
+        ) {
+            let first_ns = 1_000_000_000_u64;
+            let last_ns = first_ns + elapsed_ns;
+            let throughput = calc_throughput(visits, first_ns, last_ns);
+            prop_assert!(throughput.is_finite(), "throughput was {throughput}");
+        }
+
+        /// Property: Visit count accumulates correctly
+        #[test]
+        fn visit_count_accumulates(n in 1..100_usize) {
+            let p = Progress::new("test");
+            for _ in 0..n {
+                p.note_visit();
+            }
+            prop_assert_eq!(p.visit_count() as usize, n);
+        }
+    }
 }
