@@ -1,8 +1,2 @@
-# Clippy configuration for andweorc
-# Allow these identifiers in documentation without backticks
-doc-valid-idents = [
-    "Coz",
-    "SIGPROF",
-    "perf_event_open",
-    ".."
-]
+# https://rust-lang.github.io/rust-clippy/master/index.html#doc_markdown
+doc-valid-idents = ["Coz", "SIGPROF", "perf_event_open", ".."]

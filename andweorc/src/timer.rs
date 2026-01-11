@@ -201,15 +201,15 @@ impl std::error::Error for IntervalError {
 ///
 /// Returns an error if nanosleep fails for a reason other than being interrupted.
 pub(crate) fn nanosleep(duration: Duration) -> Result<(), NanosleepError> {
-    let mut req = duration_to_timespec(duration);
-    let mut rem = timespec {
+    let mut request = duration_to_timespec(duration);
+    let mut remaining = timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
 
     loop {
         // SAFETY: nanosleep is called with valid pointers
-        let result = unsafe { libc::nanosleep(&raw const req, &raw mut rem) };
+        let result = unsafe { libc::nanosleep(&raw const request, &raw mut remaining) };
 
         if result == 0 {
             return Ok(());
@@ -218,7 +218,7 @@ pub(crate) fn nanosleep(duration: Duration) -> Result<(), NanosleepError> {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINTR) {
             // Interrupted by signal, continue with remaining time
-            req = rem;
+            request = remaining;
         } else {
             return Err(NanosleepError::Failed(err));
         }

@@ -1,2 +1,2 @@
-edition = "2021"
-newline_style = "Unix"
+edition = "2024"
+newline_style = "unix"
