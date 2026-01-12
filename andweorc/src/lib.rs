@@ -35,6 +35,7 @@
 
 pub mod experiment;
 mod ffi;
+pub mod json_output;
 mod lock_util;
 mod per_thread;
 mod posix;
@@ -84,6 +85,16 @@ pub enum ProfilingError {
     ///
     /// This typically means the SIGPROF signal handler could not be registered.
     ExperimentInit(String),
+
+    /// Failed to create hardware performance counters.
+    ///
+    /// This typically indicates:
+    /// - `kernel.perf_event_paranoid` is too restrictive (> 1)
+    /// - Hardware counters are not available on this CPU
+    /// - Insufficient permissions
+    ///
+    /// Try: `sudo sysctl kernel.perf_event_paranoid=1`
+    PerfCounterCreation(String),
 }
 
 impl std::fmt::Display for ProfilingError {
@@ -97,6 +108,9 @@ impl std::fmt::Display for ProfilingError {
             Self::TimerCreation(msg) => write!(f, "failed to create timer: {msg}"),
             Self::TimerStart(msg) => write!(f, "failed to start timer: {msg}"),
             Self::ExperimentInit(msg) => write!(f, "failed to initialize experiment: {msg}"),
+            Self::PerfCounterCreation(msg) => {
+                write!(f, "failed to create hardware performance counters: {msg}")
+            }
         }
     }
 }
@@ -175,8 +189,8 @@ pub fn start_profiling_with_interval(interval: Duration) -> Result<(), Profiling
     // This avoids deadlock where the signal handler tries to access the profiler
     // while we're in the middle of creating it. The profiler is stored in
     // thread-local storage and accessed from the signal handler without locks.
-    let profiler = Arc::new(PerThreadProfiler::new(16));
-    experiment::set_thread_profiler(profiler);
+    let profiler = PerThreadProfiler::try_new(16).map_err(ProfilingError::PerfCounterCreation)?;
+    experiment::set_thread_profiler(Arc::new(profiler));
 
     // Get the current thread ID (Linux specific)
     // SAFETY: gettid is a simple syscall that requires no special privileges

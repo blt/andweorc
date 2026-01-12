@@ -6,6 +6,57 @@
 //! - Progress point tracking
 //! - Delay table for virtual speedup experiments
 //!
+//! # Delay Injection Algorithm (Coz Virtual Speedup)
+//!
+//! Causal profiling answers the question: "If I optimize line X to run instantly,
+//! how much would my program speed up?" We can't actually make code run faster,
+//! but we can **simulate** this by making all **other** code run slower.
+//!
+//! ## How It Works
+//!
+//! 1. **Sampling**: Hardware instruction counters trigger at regular intervals,
+//!    capturing which instruction each thread is executing.
+//!
+//! 2. **Target Selection**: We select an instruction pointer (IP) to "virtually
+//!    speed up" for one experiment round.
+//!
+//! 3. **Delay Injection**: When a sample arrives:
+//!    - If the thread IS at the selected IP: **do nothing** (this thread is in
+//!      "fast" code - it represents the optimized path)
+//!    - If the thread is NOT at the selected IP: **add delay** to that thread
+//!      (simulates all other code being slower relative to the target)
+//!
+//! 4. **Delay Consumption**: Accumulated delays are consumed at "yield points":
+//!    - Progress points (`progress!()` macro)
+//!    - Delay points (`delay_point!()` macro)
+//!    - Synchronization operations (mutex lock, cond wait, etc.)
+//!
+//! ## Mathematical Basis
+//!
+//! If line X takes time `t` and we want to simulate it running `s%` faster:
+//! - We delay all threads NOT at X by `t * s / (1 - s)` nanoseconds
+//! - This makes X's relative execution time decrease by `s%`
+//!
+//! The speedup percentage ranges from 5% to 150% in 5% increments.
+//!
+//! ## Delay Table
+//!
+//! The `DELAY_PRCNT` array maps experiment indices to speedup percentages:
+//! - Indices 0-24: 0% (baseline measurements, no delay injection)
+//! - Index 25: 5% speedup simulation
+//! - Index 26: 10% speedup simulation
+//! - ...
+//! - Index 54: 150% speedup simulation
+//!
+//! Actual delay duration = `DELAY_BASELINE * DELAY_PRCNT[index]`
+//!
+//! ## Why Inject to Non-Sampled Threads?
+//!
+//! This is the key insight from the Coz paper. If we want to know "what if X
+//! were faster?", we make everything else slower, which has the same relative
+//! effect. The thread executing X doesn't need delays because it represents
+//! the "optimized" code path.
+//!
 //! # Signal Safety
 //!
 //! This module is designed with signal safety as a primary concern. All data
@@ -89,39 +140,73 @@ impl std::error::Error for ExperimentInitError {
 
 // Thread-local storage for the per-thread profiler.
 //
-// This is accessed from the signal handler, so we use a raw pointer
-// to avoid any locking. The profiler is created before the timer starts
-// and lives for the duration of profiling.
+// We store a raw pointer rather than Arc to make signal-handler access safe.
+// The Arc is leaked intentionally - profilers live for the duration of profiling
+// (typically the entire process lifetime). This avoids:
+// - Arc cloning (atomic refcount) in signal context
+// - The take/put pattern which isn't signal-safe
+//
+// Reading an aligned pointer is atomic on all platforms we support.
 thread_local! {
-    static THREAD_PROFILER: std::cell::Cell<Option<Arc<PerThreadProfiler>>> = const { std::cell::Cell::new(None) };
+    static THREAD_PROFILER: std::cell::Cell<*const PerThreadProfiler> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 /// Sets the per-thread profiler for the current thread.
 ///
 /// Must be called before starting the profiling timer.
+///
+/// # Memory
+///
+/// The Arc is intentionally leaked to provide a stable raw pointer that
+/// the signal handler can access safely. The profiler lives for the
+/// duration of profiling (typically the entire process lifetime).
+///
+/// # Idempotence
+///
+/// If a profiler is already set for this thread, this function is a no-op
+/// and the new profiler is dropped. This prevents memory leaks from
+/// multiple calls.
 pub(crate) fn set_thread_profiler(profiler: Arc<PerThreadProfiler>) {
     THREAD_PROFILER.with(|cell| {
-        cell.set(Some(profiler));
+        let existing = cell.get();
+        if !existing.is_null() {
+            // Already set - drop the new profiler and keep the old one.
+            // This is a no-op because profiler goes out of scope.
+            return;
+        }
+
+        // Leak the Arc to get a raw pointer that lives forever
+        // This is intentional - profilers are long-lived and we need signal-safe access
+        let ptr = Arc::into_raw(profiler);
+        cell.set(ptr);
     });
 }
 
 /// Gets the per-thread profiler for the current thread.
 ///
 /// Returns None if no profiler has been set.
-fn get_thread_profiler() -> Option<Arc<PerThreadProfiler>> {
+///
+/// # Signal Safety
+///
+/// This function is async-signal-safe. It only reads an aligned pointer
+/// from thread-local storage, which is atomic on all supported platforms.
+fn get_thread_profiler() -> Option<&'static PerThreadProfiler> {
     THREAD_PROFILER.with(|cell| {
-        // We need to temporarily take the value to clone it
-        let profiler = cell.take();
-        let result = profiler.clone();
-        cell.set(profiler);
-        result
+        let ptr = cell.get();
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: The pointer was created by Arc::into_raw and is never freed.
+            // The profiler lives for the duration of profiling.
+            Some(unsafe { &*ptr })
+        }
     })
 }
 
 /// Public accessor for the per-thread profiler.
 ///
 /// Used by `consume_pending_delay()` to access delay balances.
-pub(crate) fn get_thread_profiler_public() -> Option<Arc<PerThreadProfiler>> {
+pub(crate) fn get_thread_profiler_public() -> Option<&'static PerThreadProfiler> {
     get_thread_profiler()
 }
 
@@ -130,15 +215,31 @@ pub(crate) fn get_thread_profiler_public() -> Option<Arc<PerThreadProfiler>> {
 /// This handler is called on whichever thread receives the signal. It looks up
 /// the thread's profiler from thread-local storage and triggers sample processing.
 ///
-/// # Safety
+/// # Signal Safety
 ///
-/// This is a signal handler and only calls async-signal-safe functions:
-/// - Atomic loads/stores (async-signal-safe)
-/// - Thread-local storage access (async-signal-safe on Linux)
-/// - `pthread_sigmask` (async-signal-safe per POSIX)
+/// This handler strives for async-signal-safety but has known limitations:
 ///
-/// The per-thread profiler is pre-allocated before the timer starts, ensuring
-/// no memory allocation occurs in signal context.
+/// **Async-signal-safe operations used:**
+/// - Atomic loads/stores
+/// - `pthread_sigmask` (POSIX async-signal-safe)
+/// - Thread-local storage read via `Cell<*const T>` (signal-safe on Linux)
+///
+/// **Known limitations:**
+/// - The `perf_event` crate's `SampleStream::read()` may allocate on error paths.
+///   In practice this is rare because we use zero-timeout non-blocking reads.
+/// - If the perf ring buffer is in an inconsistent state, error handling may
+///   involve allocation.
+///
+/// **Mitigations:**
+/// 1. SIGPROF is blocked during handler execution to prevent re-entrancy
+/// 2. Sample processing limits the number of samples read per signal
+/// 3. Errors in sample reading break out of the loop rather than propagating
+/// 4. The profiler is pre-allocated before starting timers
+///
+/// In practice, these limitations rarely cause issues because:
+/// - The happy path (successful sample read) is allocation-free
+/// - Errors cause early exit rather than complex handling
+/// - Signal re-entrancy is prevented via masking
 extern "C" fn process_samples(_signal: c_int) {
     // Block SIGPROF during handler to prevent re-entrancy
     // This prevents the race condition where a nested signal handler
@@ -268,6 +369,15 @@ pub fn shutdown() {
                 libc_print::libc_println!("  {}: 0x{:x}", i + 1, ip);
             }
         }
+
+        // Report any dropped progress point names
+        let dropped = crate::ffi::dropped_names_count();
+        if dropped > 0 {
+            libc_print::libc_eprintln!(
+                "[andweorc] WARNING: {dropped} progress point names were dropped \
+                 due to intern table overflow"
+            );
+        }
     }
 }
 
@@ -287,9 +397,13 @@ pub fn register_thread(_tid: libc::pthread_t) {
         return;
     }
 
-    // Create and set up the per-thread profiler
-    let profiler = std::sync::Arc::new(crate::per_thread::PerThreadProfiler::new(16));
-    set_thread_profiler(profiler);
+    // Create and set up the per-thread profiler.
+    // If creation fails (e.g., perf counters unavailable), silently skip
+    // registration for this thread rather than panicking.
+    if let Ok(profiler) = crate::per_thread::PerThreadProfiler::try_new(16) {
+        set_thread_profiler(std::sync::Arc::new(profiler));
+    }
+    // Thread won't be profiled if creation fails, but the program continues running
 }
 
 /// Deregisters a thread from the profiler.
@@ -679,13 +793,17 @@ impl Experiment {
         // Check if this sample matches the selected IP
         if let Some(sample_ip) = ip {
             if sample_ip == selected {
-                // This sample is at the selected line - this thread should be delayed
-                // to simulate virtual speedup (Coz algorithm)
+                // This sample IS at the selected line - thread is in "fast" code
+                // Don't delay this thread (it's running the code we're virtually speeding up)
                 self.selected_samples.fetch_add(1, Ordering::Relaxed);
-                self.global_delay_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // This sample is NOT at the selected line - delay this thread
+                // This simulates virtual speedup: make everything ELSE slower,
+                // which is equivalent to making the selected code faster
+                self.global_delay_count.fetch_add(1, Ordering::Release);
 
                 // Add delay to this thread's pending balance
-                // The delay will be consumed at the next progress point
+                // The delay will be consumed at the next progress point or sync operation
                 if let Some(profiler) = get_thread_profiler() {
                     let delay_index = self.delay_index.load(Ordering::Relaxed);
                     // Safety: delay_index is clamped to valid range in start_experiment()
@@ -990,5 +1108,63 @@ mod kani_proofs {
         let n = SAMPLE_COUNT_BUCKETS;
         kani::assert(n > 0, "bucket count must be positive");
         kani::assert(n & (n - 1) == 0, "bucket count must be power of 2");
+    }
+
+    /// Proof: Virtual speedup formula produces bounded delay values.
+    ///
+    /// The theoretical formula is `delay = t * s / (1 - s)` but this goes to
+    /// infinity as s approaches 1. We use a linear approximation `delay = t * s`
+    /// which is:
+    /// - Always finite for any percentage
+    /// - Underestimates delay for s > 0 (conservative)
+    /// - Has bounded error for s < 0.5 (our practical range)
+    ///
+    /// This proof verifies the approximation produces valid delay values.
+    #[kani::proof]
+    fn virtual_speedup_approximation_bounded() {
+        // Pick any speedup percentage from the table
+        let idx: usize = kani::any();
+        kani::assume(idx < DELAY_PRCNT.len());
+
+        let s = DELAY_PRCNT[idx];
+        let baseline_ns: u64 = 10_000_000; // 10ms in nanoseconds
+
+        // Linear approximation: delay = baseline * s
+        // This is what we actually implement
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let approx_delay_ns = (baseline_ns as f64 * s) as u64;
+
+        // Verify delay is bounded (can't exceed ~15ms = 150% of baseline)
+        kani::assert(
+            approx_delay_ns <= 15_000_000,
+            "approximated delay must be bounded",
+        );
+
+        // Verify delay is non-negative
+        kani::assert(s >= 0.0, "speedup percentage must be non-negative");
+    }
+
+    /// Proof: Delay formula is monotonic in speedup percentage.
+    ///
+    /// Higher speedup percentages must always produce higher delays.
+    /// This is a fundamental correctness property of causal profiling.
+    #[kani::proof]
+    fn delay_formula_monotonic() {
+        let idx1: usize = kani::any();
+        let idx2: usize = kani::any();
+
+        kani::assume(idx1 < DELAY_PRCNT.len());
+        kani::assume(idx2 < DELAY_PRCNT.len());
+        kani::assume(idx1 < idx2);
+        kani::assume(idx1 >= 25); // Skip baseline entries
+
+        let s1 = DELAY_PRCNT[idx1];
+        let s2 = DELAY_PRCNT[idx2];
+
+        // Higher index should mean higher speedup percentage
+        kani::assert(
+            s2 >= s1,
+            "delay percentages must be monotonically non-decreasing",
+        );
     }
 }

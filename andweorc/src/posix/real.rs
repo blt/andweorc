@@ -105,6 +105,12 @@ impl<T> LazyFn<T> {
 
         if !current.is_null() {
             // Already resolved successfully
+            // SAFETY: The transmute is valid because:
+            // 1. `T` is a function pointer type (enforced by caller usage pattern)
+            // 2. `current` was returned by `dlsym` for the same function signature
+            // 3. Function pointers and `*mut c_void` have the same size/alignment on all
+            //    platforms we support (Linux x86_64/aarch64)
+            // 4. We verified `current` is non-null (valid dlsym return for found symbol)
             return Some(mem::transmute_copy(&current));
         }
 
@@ -139,6 +145,8 @@ impl<T> LazyFn<T> {
 
                 // Store the resolved pointer
                 self.ptr.store(real, Ordering::Release);
+                // SAFETY: Same as the transmute in get() fast path - `real` is a valid
+                // non-null pointer returned by dlsym for the function matching type T.
                 Some(mem::transmute_copy(&real))
             }
             Err(actual) => {
@@ -148,6 +156,8 @@ impl<T> LazyFn<T> {
                     None
                 } else {
                     // Already resolved by another thread
+                    // SAFETY: Same as the transmute in get() fast path - `actual` was
+                    // stored by another thread after successful dlsym resolution.
                     Some(mem::transmute_copy(&actual))
                 }
             }

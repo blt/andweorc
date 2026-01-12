@@ -5,6 +5,79 @@
 //! 2. Runs experiments with different virtual speedups
 //! 3. Measures throughput changes
 //! 4. Records results for analysis
+//!
+//! # Impact Score Formula
+//!
+//! The causal impact of a code location is calculated using linear regression
+//! on the relationship between speedup percentage and throughput.
+//!
+//! ## Intuition
+//!
+//! If optimizing line X would improve performance, then:
+//! - Higher virtual speedup → higher throughput
+//! - The slope of this relationship indicates how much throughput improves
+//!   per unit of speedup
+//!
+//! ## Calculation
+//!
+//! Given `n` experiments at location X with varying speedup percentages:
+//!
+//! ```text
+//! Impact = Σ[(sᵢ - s̄)(tᵢ - t̄)] / Σ[(sᵢ - s̄)²]
+//! ```
+//!
+//! Where:
+//! - `sᵢ` = speedup percentage for experiment i (0.0 to 1.5)
+//! - `tᵢ` = throughput measured for experiment i
+//! - `s̄` = mean speedup percentage
+//! - `t̄` = mean throughput
+//!
+//! This is standard Ordinary Least Squares (OLS) regression slope.
+//!
+//! ## Interpretation
+//!
+//! - **Impact > 0**: Optimizing this code would **increase** throughput.
+//!   Higher impact = more valuable optimization target.
+//! - **Impact ≈ 0**: Optimizing this code would have **no effect** on throughput.
+//!   The code is not on the critical path.
+//! - **Impact < 0**: Optimizing this code would **decrease** throughput.
+//!   This is unusual and typically indicates measurement noise.
+//!
+//! ## Statistical Validation
+//!
+//! Raw impact scores can be misleading without statistical context. The
+//! [`RegressionResult`] structure provides:
+//!
+//! - **R² (coefficient of determination)**: How well speedup explains throughput
+//!   variance. R² > 0.7 indicates a strong relationship.
+//! - **95% Confidence Interval**: Range where the true impact likely lies.
+//!   Significant if the interval doesn't include zero.
+//! - **Standard Error**: Uncertainty in the slope estimate.
+//!
+//! ## Example
+//!
+//! ```text
+//! Location: src/db/query.rs:142
+//! Speedup | Throughput
+//! --------|----------
+//! 0%      | 1000 ops/s
+//! 25%     | 1125 ops/s
+//! 50%     | 1250 ops/s
+//! 75%     | 1375 ops/s
+//! 100%    | 1500 ops/s
+//!
+//! Impact = 500 (throughput increases 500 ops/s per 100% speedup)
+//! R² = 1.0 (perfect linear fit)
+//! CI = [490, 510] (significant, doesn't cross zero)
+//!
+//! Interpretation: Optimizing this query by 100% would increase
+//! throughput by ~500 ops/s. This is a high-value optimization target.
+//! ```
+//!
+//! ## Ranking
+//!
+//! Locations are ranked by impact score descending. Use [`ProfilingResults::significant_impacts()`]
+//! to filter to only statistically significant results.
 
 use crate::experiment::get_instance;
 use crate::lock_util::{recover_read, recover_write};
@@ -45,7 +118,7 @@ fn config_index_to_delay_index(config_index: usize) -> usize {
 }
 
 /// Results from a single experiment round.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ExperimentResult {
     /// The instruction pointer that was virtually sped up.
     pub ip: usize,
@@ -178,7 +251,7 @@ impl ProfilingResults {
 ///
 /// Provides slope, intercept, confidence intervals, and goodness-of-fit metrics.
 /// These statistics allow users to assess the reliability of causal impact claims.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RegressionResult {
     /// Slope of the regression line (throughput change per unit speedup).
     /// This is the primary "causal impact" metric.

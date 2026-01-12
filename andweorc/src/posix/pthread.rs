@@ -90,12 +90,21 @@ pub unsafe extern "C" fn pthread_create(
         real_arg: arg,
     });
 
-    real_fn(
+    let wrapper_ptr = Box::into_raw(wrapper);
+    let result = real_fn(
         thread,
         attr,
         thread_start_wrapper,
-        Box::into_raw(wrapper).cast::<c_void>(),
-    )
+        wrapper_ptr.cast::<c_void>(),
+    );
+
+    // If pthread_create failed, the wrapper was never consumed by the new thread.
+    // Reclaim it to prevent a memory leak.
+    if result != 0 {
+        drop(Box::from_raw(wrapper_ptr));
+    }
+
+    result
 }
 
 type PthreadExitFn = unsafe extern "C" fn(*mut c_void) -> !;

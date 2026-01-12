@@ -146,12 +146,15 @@ andweorc/           Workspace root
 
 1. Continuously sample all threads to find where they're executing
 2. Select a "line" (instruction address range) to virtually speed up
-3. When a sample hits the selected line, don't delay that thread
-4. Delay all OTHER threads proportionally—simulates speeding up selected line
-5. Measure throughput via progress points
-6. Correlate: if delaying others improves throughput, the selected line is
-   worth optimizing
-7. Repeat with different speedup percentages (0% to ~100%)
+3. For each sample:
+   - If the sampled thread IS at the selected line: no delay (fast code path)
+   - If the sampled thread is NOT at the selected line: add delay to that thread
+4. This effectively makes all code *except* the selected line slower, simulating
+   that the selected line runs faster
+5. Measure throughput via progress points during the experiment
+6. Run experiments at multiple speedup percentages (5% to 150%)
+7. Calculate impact: the slope of throughput vs speedup percentage indicates
+   how much optimizing this line would improve overall performance
 
 ### Output Format
 

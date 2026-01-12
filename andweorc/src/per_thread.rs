@@ -33,6 +33,18 @@ use perf_event::SampleStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Maximum pending delay in nanoseconds (100ms).
+///
+/// This caps the delay to prevent absurdly long sleeps that could stall
+/// the program. If delays accumulate beyond this, we clamp to this value.
+/// This can happen if:
+/// - A thread never hits a progress point or yield point
+/// - Many samples accumulate before consumption
+///
+/// 100ms is chosen as a reasonable upper bound - it's long enough to
+/// measure causal impact but short enough to not freeze the program.
+const MAX_PENDING_DELAY_NS: u64 = 100_000_000; // 100ms
+
 /// Per-thread profiler that manages perf sampling and delay injection.
 ///
 /// Each OS thread has one of these, managed by the global `Experiment`.
@@ -69,14 +81,14 @@ impl PerThreadProfiler {
     ///
     /// * `total_samples` - Maximum samples to read per polling period.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if hardware instruction counters are not available. This requires:
+    /// Returns an error if hardware instruction counters are not available. This requires:
     /// - `kernel.perf_event_paranoid` <= 1
     /// - A CPU that supports instruction counting (most modern `x86_64`/ARM)
     ///
     /// Use `sudo sysctl kernel.perf_event_paranoid=1` to enable.
-    pub(crate) fn new(total_samples: u16) -> Self {
+    pub(crate) fn try_new(total_samples: u16) -> Result<Self, String> {
         // Use hardware instruction counters - REQUIRED for correct causal profiling.
         // CPU_CLOCK would create a feedback loop: delays affect sampling rate,
         // which corrupts the causal measurements.
@@ -92,27 +104,26 @@ impl PerThreadProfiler {
             Ok(s) => {
                 // Enable the perf event to start collecting samples
                 if let Err(e) = s.enable() {
-                    panic!(
-                        "[andweorc] FATAL: Hardware instruction counters unavailable: {e}\n\
+                    return Err(format!(
+                        "failed to enable perf counters: {e}. \
                          Try: sudo sysctl kernel.perf_event_paranoid=1"
-                    );
+                    ));
                 }
-                Some(s)
+                s
             }
             Err(e) => {
-                panic!(
-                    "[andweorc] FATAL: Hardware instruction counters unavailable: {e}\n\
-                     Causal profiling requires hardware performance counters.\n\
+                return Err(format!(
+                    "failed to create perf counters: {e}. \
                      Try: sudo sysctl kernel.perf_event_paranoid=1"
-                );
+                ));
             }
         };
 
-        Self {
+        Ok(Self {
             total_samples,
-            sampler,
+            sampler: Some(sampler),
             pending_delay_ns: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Adds delay to this thread's pending balance.
@@ -124,6 +135,17 @@ impl PerThreadProfiler {
     /// # Signal Safety
     ///
     /// This function is async-signal-safe: it only uses an atomic `fetch_add`.
+    ///
+    /// # Overflow Handling
+    ///
+    /// Uses wrapping addition for simplicity and signal safety. In practice,
+    /// overflow is impossible under normal conditions:
+    /// - Delays are typically 1-15ms per sample
+    /// - Samples arrive at ~1000/sec
+    /// - Even at max rate, it would take centuries to overflow u64
+    ///
+    /// The delay is clamped to `MAX_PENDING_DELAY_NS` at consumption time
+    /// to prevent pathological cases from stalling the program.
     #[inline]
     pub(crate) fn add_delay(&self, ns: u64) {
         self.pending_delay_ns.fetch_add(ns, Ordering::Relaxed);
@@ -131,15 +153,25 @@ impl PerThreadProfiler {
 
     /// Returns and clears the pending delay for this thread.
     ///
-    /// Returns the accumulated delay in nanoseconds and resets the counter to zero.
-    /// The caller should sleep for this duration to simulate virtual speedup.
+    /// Returns the accumulated delay in nanoseconds (clamped to [`MAX_PENDING_DELAY_NS`])
+    /// and resets the counter to zero. The caller should sleep for this duration
+    /// to simulate virtual speedup.
+    ///
+    /// # Clamping
+    ///
+    /// If accumulated delays exceed `MAX_PENDING_DELAY_NS` (100ms), the returned
+    /// value is clamped to that maximum. This prevents:
+    /// - Threads that rarely hit progress points from stalling indefinitely
+    /// - Pathological accumulation from freezing the program
     ///
     /// # Memory Ordering
     ///
     /// Uses Acquire ordering to synchronize with Relaxed stores from `add_delay()`.
     #[inline]
     pub(crate) fn take_pending_delay(&self) -> u64 {
-        self.pending_delay_ns.swap(0, Ordering::Acquire)
+        let raw = self.pending_delay_ns.swap(0, Ordering::Acquire);
+        // Clamp to maximum to prevent pathological stalls
+        raw.min(MAX_PENDING_DELAY_NS)
     }
 
     /// Processes any pending samples from the perf event stream.

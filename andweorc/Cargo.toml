@@ -20,6 +20,8 @@ rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 perf-event = { git = "https://github.com/blt/perf-event", rev = "2b55339d0ff6440b0b7156c8d16d9dc896a4372f", default-features = false }
 andweorc-macros = { path = "../andweorc-macros" }
 backtrace = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 proptest = "1.4"

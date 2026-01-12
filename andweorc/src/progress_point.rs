@@ -147,7 +147,14 @@ impl Progress {
         self.visits.fetch_add(1, Ordering::Release);
 
         // Only update timestamps if generation hasn't changed (no concurrent reset)
-        // This prevents corrupted timestamps from racing with reset()
+        // This prevents corrupted timestamps from racing with reset().
+        //
+        // Memory ordering correctness:
+        // - reset() uses fetch_add with Release ordering
+        // - This load uses Acquire ordering
+        // - If reset() completed its fetch_add, we WILL see the new generation here
+        // - If we still see the old generation, reset() hasn't happened-before this load,
+        //   so our updates are valid and reset() will overwrite them afterward
         if self.generation.load(Ordering::Acquire) == gen {
             // Set first visit timestamp if this is the first visit
             // Use compare_exchange to atomically set only if still 0

@@ -165,25 +165,37 @@ fn test_hardware_counters() {
 
 /// Checks if hardware performance counters are available on this system.
 ///
-/// This function attempts to create a test counter to verify that the
-/// perf subsystem is functional. Use this in tests to skip when counters
-/// aren't available (e.g., in containers or VMs without perf support).
+/// This function attempts to create a test sampler to verify that the
+/// perf subsystem supports the sampling mode used by the profiler.
+/// Use this in tests to skip when counters aren't available (e.g., in
+/// containers or VMs without perf support).
 ///
 /// # Returns
 ///
-/// `true` if hardware counters can be created, `false` otherwise.
+/// `true` if hardware counter sampling can be created and enabled, `false` otherwise.
 #[must_use]
 pub fn perf_counters_available() -> bool {
     use perf_event::events::Hardware;
+    use perf_event::sample::PerfSampleType;
 
-    // Try to create a simple instruction counter
-    // This uses the same API as per_thread.rs but doesn't enable or sample
-    perf_event::Builder::new()
+    // Try to create and enable a sample stream with the same parameters
+    // as per_thread.rs. This is more restrictive than a simple counter()
+    // because sampling requires additional kernel support.
+    let sampler_result = perf_event::Builder::new()
         .kind(Hardware::INSTRUCTIONS)
-        .observe_self()
-        .any_cpu()
-        .counter()
-        .is_ok()
+        .sample_frequency(1000)
+        .sample(PerfSampleType::IP)
+        .sample(PerfSampleType::TID)
+        .sample(PerfSampleType::TIME)
+        .sample_stream();
+
+    match sampler_result {
+        Ok(sampler) => {
+            // Also test that we can enable the sampler
+            sampler.enable().is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
