@@ -7,38 +7,14 @@
 //! 4. Records results for analysis
 
 use crate::experiment::get_instance;
+use crate::lock_util::{recover_read, recover_write};
 use crate::progress_point::Progress;
 use crate::timer::nanosleep;
 use libc::c_void;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-
-/// Helper to recover from a poisoned read lock.
-///
-/// Lock poisoning occurs when a thread panics while holding the lock.
-/// For profiling data, we recover the guard and continue since:
-/// - Profiling data isn't safety-critical
-/// - Losing all data is worse than having potentially-incomplete data
-fn recover_read<'a, T>(
-    result: Result<RwLockReadGuard<'a, T>, PoisonError<RwLockReadGuard<'a, T>>>,
-) -> RwLockReadGuard<'a, T> {
-    result.unwrap_or_else(|poison| {
-        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
-        poison.into_inner()
-    })
-}
-
-/// Helper to recover from a poisoned write lock.
-fn recover_write<'a, T>(
-    result: Result<RwLockWriteGuard<'a, T>, PoisonError<RwLockWriteGuard<'a, T>>>,
-) -> RwLockWriteGuard<'a, T> {
-    result.unwrap_or_else(|poison| {
-        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
-        poison.into_inner()
-    })
-}
 
 /// Number of baseline entries at the start of the delay table.
 const BASELINE_ENTRIES: usize = 25;
@@ -445,7 +421,8 @@ impl Runner {
         // Reset progress point for this round
         progress_point.reset();
 
-        // Start the experiment
+        // Start the experiment - enable delay injection
+        crate::set_profiling_active(true);
         if let Some(ip_val) = ip {
             experiment.start_experiment(ip_val as *const c_void, speedup_index);
         }
@@ -453,8 +430,9 @@ impl Runner {
         // Wait for the round duration
         let _ = nanosleep(self.config.round_duration);
 
-        // Stop the experiment
+        // Stop the experiment - disable delay injection
         experiment.stop_experiment();
+        crate::set_profiling_active(false);
 
         // Get results
         let stats = experiment.stats();

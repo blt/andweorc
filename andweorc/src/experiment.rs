@@ -14,6 +14,7 @@
 //! - Thread-local storage (accessed without locks)
 //! - Pre-allocated fixed-size arrays with lock-free access
 
+use crate::lock_util::{recover_read, recover_write};
 use crate::per_thread::PerThreadProfiler;
 use crate::progress_point::Progress;
 use libc::{c_int, c_void};
@@ -21,31 +22,8 @@ use nix::errno::Errno;
 use nix::sys::signal::{signal, SigHandler, Signal};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
-
-/// Helper to recover from a poisoned read lock.
-///
-/// For profiling data, we recover the guard and continue since losing
-/// all progress point data is worse than having potentially-incomplete data.
-fn recover_read<'a, T>(
-    result: Result<RwLockReadGuard<'a, T>, PoisonError<RwLockReadGuard<'a, T>>>,
-) -> RwLockReadGuard<'a, T> {
-    result.unwrap_or_else(|poison| {
-        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
-        poison.into_inner()
-    })
-}
-
-/// Helper to recover from a poisoned write lock.
-fn recover_write<'a, T>(
-    result: Result<RwLockWriteGuard<'a, T>, PoisonError<RwLockWriteGuard<'a, T>>>,
-) -> RwLockWriteGuard<'a, T> {
-    result.unwrap_or_else(|poison| {
-        libc_print::libc_eprintln!("[andweorc] warning: recovering from poisoned lock");
-        poison.into_inner()
-    })
-}
 
 /// Percentage multipliers for the delay table.
 ///
@@ -71,6 +49,14 @@ const DELAY_BASELINE: Duration = Duration::from_millis(10);
 /// Number of buckets for the sample count hash table.
 /// Must be a power of 2 for efficient modulo via bitwise AND.
 const SAMPLE_COUNT_BUCKETS: usize = 8192;
+
+/// Maximum linear probing iterations before giving up.
+///
+/// This bounds the worst-case time spent in the signal handler.
+/// With 8192 buckets and good hash distribution, 32 probes should
+/// be sufficient for finding or inserting most IPs. If we exhaust
+/// probes, the sample is silently dropped (acceptable for profiling).
+const MAX_PROBE_ITERATIONS: usize = 32;
 
 /// Flag indicating whether the experiment singleton is fully initialized.
 /// This is used by the signal handler to avoid accessing uninitialized data.
@@ -130,6 +116,13 @@ fn get_thread_profiler() -> Option<Arc<PerThreadProfiler>> {
         cell.set(profiler);
         result
     })
+}
+
+/// Public accessor for the per-thread profiler.
+///
+/// Used by `consume_pending_delay()` to access delay balances.
+pub(crate) fn get_thread_profiler_public() -> Option<Arc<PerThreadProfiler>> {
+    get_thread_profiler()
 }
 
 /// Signal handler that processes perf samples when SIGPROF fires.
@@ -214,6 +207,18 @@ pub(crate) fn try_get_instance() -> Result<&'static Experiment, &'static Experim
 ///
 /// Panics if the experiment failed to initialize. This can happen if
 /// the SIGPROF signal handler cannot be registered.
+///
+/// # Signal Safety Note
+///
+/// Although this function can panic, it is safe to call from the signal handler
+/// code path because:
+/// 1. The signal handler checks `EXPERIMENT_INITIALIZED` before calling code that
+///    uses this function
+/// 2. `EXPERIMENT_INITIALIZED` is only set to true AFTER successful initialization
+/// 3. Therefore, if reached via signal handler, initialization has already succeeded
+///
+/// This panic can only occur during initial setup (outside signal context), not
+/// during production profiling operations.
 pub(crate) fn get_instance() -> &'static Experiment {
     match try_get_instance() {
         Ok(exp) => exp,
@@ -304,12 +309,14 @@ impl SampleCounts {
 
     /// Increments the count for the given IP.
     ///
-    /// Uses lock-free linear probing. If the table is full and the IP
-    /// is not found, the increment is silently dropped.
+    /// Uses lock-free linear probing with bounded iterations. If the probe
+    /// limit is reached without finding a slot, the increment is silently dropped.
     ///
     /// # Signal Safety
     ///
     /// This function is async-signal-safe: it only uses atomic operations.
+    /// The probe count is bounded by `MAX_PROBE_ITERATIONS` to ensure
+    /// bounded execution time in signal handler context.
     ///
     /// # Memory Ordering
     ///
@@ -323,8 +330,8 @@ impl SampleCounts {
 
         let start = Self::hash(ip);
 
-        // Linear probing with a maximum of SAMPLE_COUNT_BUCKETS attempts
-        for i in 0..SAMPLE_COUNT_BUCKETS {
+        // Linear probing with bounded iterations for signal safety
+        for i in 0..MAX_PROBE_ITERATIONS {
             let idx = (start + i) & (SAMPLE_COUNT_BUCKETS - 1);
             let entry = &self.entries[idx];
 
@@ -360,7 +367,7 @@ impl SampleCounts {
             }
             // Slot occupied by different IP, continue probing
         }
-        // Table full, silently drop this sample (acceptable for profiling)
+        // Probe limit reached, silently drop this sample (acceptable for profiling)
     }
 
     /// Returns all (IP, count) pairs with non-zero counts.
@@ -593,10 +600,23 @@ impl Experiment {
         // Check if this sample matches the selected IP
         if let Some(sample_ip) = ip {
             if sample_ip == selected {
-                // This sample is at the selected line - increment delay count
-                // to trigger delays in other threads (virtual speedup)
+                // This sample is at the selected line - this thread should be delayed
+                // to simulate virtual speedup (Coz algorithm)
                 self.selected_samples.fetch_add(1, Ordering::Relaxed);
                 self.global_delay_count.fetch_add(1, Ordering::Relaxed);
+
+                // Add delay to this thread's pending balance
+                // The delay will be consumed at the next progress point
+                if let Some(profiler) = get_thread_profiler() {
+                    let delay_index = self.delay_index.load(Ordering::Relaxed);
+                    // Safety: delay_index is clamped to valid range in start_experiment()
+                    if delay_index < self.delay_table.len() {
+                        // Allow truncation: delay values are bounded to max 15ms (< u64::MAX)
+                        #[allow(clippy::cast_possible_truncation)]
+                        let delay_ns = self.delay_table[delay_index].as_nanos() as u64;
+                        profiler.add_delay(delay_ns);
+                    }
+                }
             }
         }
     }

@@ -34,6 +34,7 @@
 //! ```
 
 pub mod experiment;
+mod lock_util;
 mod per_thread;
 // NOTE: posix module disabled for now - pthread interceptors require LD_PRELOAD
 // and don't work when directly linked (dlsym returns NULL for RTLD_NEXT)
@@ -44,8 +45,13 @@ mod timer;
 
 use per_thread::PerThreadProfiler;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Global flag indicating whether profiling is currently active.
+/// Used to short-circuit delay consumption checks when profiling is disabled.
+static PROFILING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Errors that can occur during profiling operations.
 ///
@@ -223,6 +229,87 @@ pub fn stop_profiling() {
             // Timer is dropped here, which calls timer_delete via Drop
         }
     });
+}
+
+/// Returns whether profiling is currently active for any thread.
+///
+/// This is used to short-circuit delay consumption checks when profiling
+/// is disabled, avoiding unnecessary overhead.
+#[inline]
+pub fn is_profiling_active() -> bool {
+    PROFILING_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Enables the profiling active flag.
+///
+/// Called when profiling experiments start.
+pub(crate) fn set_profiling_active(active: bool) {
+    PROFILING_ACTIVE.store(active, Ordering::Release);
+}
+
+/// Consumes any pending delay for the current thread.
+///
+/// This function is the core of the Coz virtual speedup mechanism. When called,
+/// it checks if the current thread has accumulated delay debt (from samples
+/// hitting the selected code during an experiment). If so, it sleeps for
+/// that duration to simulate the virtual speedup.
+///
+/// # Usage
+///
+/// This is called automatically from:
+/// - Progress points (`progress!()` macro)
+/// - Delay points (`delay_point!()` macro)
+/// - Profiled synchronization wrappers
+///
+/// # Performance
+///
+/// When profiling is not active, this function returns immediately with minimal
+/// overhead (a single atomic load).
+#[inline]
+pub fn consume_pending_delay() {
+    // Fast path: skip if profiling is not active
+    if !is_profiling_active() {
+        return;
+    }
+
+    // Get the thread profiler from thread-local storage
+    if let Some(profiler) = experiment::get_thread_profiler_public() {
+        let pending_ns = profiler.take_pending_delay();
+        if pending_ns > 0 {
+            let delay = Duration::from_nanos(pending_ns);
+            // Use nanosleep to apply the delay
+            // Ignore errors - we're simulating delays, not guaranteeing them
+            let _ = timer::nanosleep(delay);
+        }
+    }
+}
+
+/// Insert a delay consumption point in tight loops.
+///
+/// Use this macro in loops that don't have progress points but where delay
+/// injection is needed for accurate causal profiling.
+///
+/// # Example
+///
+/// ```ignore
+/// use andweorc::delay_point;
+///
+/// fn tight_loop() {
+///     for i in 0..1_000_000 {
+///         // ... do work ...
+///         delay_point!();  // Allow delays to be injected
+///     }
+/// }
+/// ```
+///
+/// # Performance
+///
+/// When profiling is not active, this expands to a single atomic load check.
+#[macro_export]
+macro_rules! delay_point {
+    () => {
+        $crate::consume_pending_delay()
+    };
 }
 
 /// Re-export the profile attribute macro.
