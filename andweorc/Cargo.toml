@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [lib]
-crate-type = ["lib", "cdylib"]
+crate-type = ["lib", "dylib"]
 doctest = false
 
 [dependencies]

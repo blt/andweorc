@@ -34,14 +34,14 @@
 //! ```
 
 pub mod experiment;
+mod ffi;
 mod lock_util;
 mod per_thread;
-// NOTE: posix module disabled for now - pthread interceptors require LD_PRELOAD
-// and don't work when directly linked (dlsym returns NULL for RTLD_NEXT)
-// mod posix;
+mod posix;
 pub mod progress_point;
 pub mod runner;
 mod timer;
+pub mod validate;
 
 use per_thread::PerThreadProfiler;
 use std::cell::RefCell;

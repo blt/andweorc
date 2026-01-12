@@ -226,6 +226,85 @@ pub(crate) fn get_instance() -> &'static Experiment {
     }
 }
 
+/// Initializes the experiment singleton for `LD_PRELOAD` mode.
+///
+/// This is similar to `try_get_instance()` but returns the error type directly
+/// for easier error handling in the library constructor.
+///
+/// # Errors
+///
+/// Returns an error if the SIGPROF signal handler cannot be registered.
+pub fn try_init() -> Result<&'static Experiment, ExperimentInitError> {
+    try_get_instance().map_err(|e| *e)
+}
+
+/// Shuts down the profiler and outputs results.
+///
+/// Called from the library destructor or explicitly when profiling should stop.
+/// This function:
+/// 1. Stops any active experiment
+/// 2. Sets profiling inactive
+/// 3. Outputs accumulated results
+pub fn shutdown() {
+    // Mark profiling as inactive first
+    crate::set_profiling_active(false);
+
+    // Stop any active experiment
+    if let Ok(exp) = try_get_instance() {
+        exp.stop_experiment();
+
+        // Output basic statistics
+        let total = exp.total_samples.load(Ordering::Acquire);
+        let selected = exp.selected_samples.load(Ordering::Acquire);
+        libc_print::libc_println!(
+            "[andweorc] stats: total_samples={total}, selected_samples={selected}"
+        );
+
+        // Output top sampled locations
+        let top = exp.top_ips(10);
+        if !top.is_empty() {
+            libc_print::libc_println!("[andweorc] top sampled locations:");
+            for (i, ip) in top.iter().enumerate() {
+                libc_print::libc_println!("  {}: 0x{:x}", i + 1, ip);
+            }
+        }
+    }
+}
+
+/// Registers a thread with the profiler.
+///
+/// Called from the `pthread_create` interceptor to set up profiling for a new thread.
+/// This sets up the per-thread profiler and registers it with the experiment.
+///
+/// # Arguments
+///
+/// * `_tid` - The pthread ID of the thread being registered (currently unused,
+///   but reserved for future thread tracking).
+pub fn register_thread(_tid: libc::pthread_t) {
+    // Only create profiler if profiling is actually active
+    // This prevents crashes when hardware counters aren't available
+    if !crate::is_profiling_active() {
+        return;
+    }
+
+    // Create and set up the per-thread profiler
+    let profiler = std::sync::Arc::new(crate::per_thread::PerThreadProfiler::new(16));
+    set_thread_profiler(profiler);
+}
+
+/// Deregisters a thread from the profiler.
+///
+/// Called from the `pthread_exit` interceptor to clean up profiling state.
+/// Currently a no-op as thread-local storage handles cleanup automatically.
+///
+/// # Arguments
+///
+/// * `_tid` - The pthread ID of the thread being deregistered.
+pub fn deregister_thread(_tid: libc::pthread_t) {
+    // Thread-local storage handles cleanup automatically via Drop
+    // No explicit cleanup needed currently
+}
+
 /// A single sample entry containing an IP and its count.
 ///
 /// IP and count are stored together to ensure they share a cache line,

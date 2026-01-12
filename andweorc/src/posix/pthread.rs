@@ -1,389 +1,272 @@
-use core::mem;
+//! Pthread function interception for causal profiling.
+//!
+//! This module intercepts pthread synchronization functions to inject delays
+//! at "yield points" where threads naturally pause. This implements the Coz
+//! virtual speedup mechanism.
+//!
+//! # Delay Injection Points
+//!
+//! Delays are consumed BEFORE acquiring locks (not after) because:
+//! 1. The thread is about to potentially wait anyway
+//! 2. Doesn't affect lock acquisition order
+//! 3. Maintains program correctness
+//!
+//! # Functions Intercepted
+//!
+//! - Mutex: `pthread_mutex_lock`
+//! - Condition variables: `pthread_cond_wait`, `pthread_cond_timedwait`
+//! - Reader-writer locks: `pthread_rwlock_rdlock`, `pthread_rwlock_wrlock`
+//! - Thread lifecycle: `pthread_create`, `pthread_exit`
+
+use crate::posix::real::LazyFn;
+use core::ffi::c_void;
 use libc::{
-    c_int,
-    c_void,
-    pthread_attr_t,
-    // pthread_cond_t, pthread_mutex_t, pthread_rwlock_t,
-    pthread_t,
-    // sigset_t,
-    // sigval,
-    // timespec,
-    RTLD_NEXT,
+    c_int, pthread_attr_t, pthread_cond_t, pthread_mutex_t, pthread_rwlock_t, pthread_t, timespec,
 };
-use nix::sys::pthread::pthread_self;
-use spin::Once;
-// use std::ffi::{CStr, CString};
 
-// //
-// // pthread_tryjoin_np
-// //
-// static PTHREAD_TRYJOIN_NP: Lazy<extern "C" fn(pthread_t, *mut *mut c_void) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_tryjoin_np").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(pthread_t, *mut *mut c_void) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_tryjoin_np(thread: pthread_t, retval: *mut *mut c_void) -> c_int {
-//     PTHREAD_TRYJOIN_NP(thread, retval)
-// }
+// =============================================================================
+// THREAD LIFECYCLE
+// =============================================================================
 
-// //
-// // pthread_timedjoin_np
-// //
-// static PTHREAD_TIMEDJOIN_NP: Lazy<
-//     extern "C" fn(pthread_t, *mut *mut c_void, *const timespec) -> c_int,
-// > = Lazy::new(|| unsafe {
-//     let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_timedjoin_np").as_ptr());
-//     mem::transmute::<
-//         *mut c_void,
-//         extern "C" fn(pthread_t, *mut *mut c_void, *const timespec) -> c_int,
-//     >(ptr)
-// });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_timedjoin_np(
-//     thread: pthread_t,
-//     retval: *mut *mut c_void,
-//     abstime: *const timespec,
-// ) -> c_int {
-//     PTHREAD_TIMEDJOIN_NP(thread, retval, abstime)
-// }
+type PthreadCreateFn = unsafe extern "C" fn(
+    *mut pthread_t,
+    *const pthread_attr_t,
+    extern "C" fn(*mut c_void) -> *mut c_void,
+    *mut c_void,
+) -> c_int;
 
-// //
-// // pthread_sigmask
-// //
-// static PTHREAD_SIGMASK: Lazy<extern "C" fn(c_int, *const sigset_t, *mut sigset_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_sigmask").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(c_int, *const sigset_t, *mut sigset_t) -> c_int>(
-//             ptr,
-//         )
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_sigmask(
-//     how: c_int,
-//     set: *const sigset_t,
-//     oldset: *mut sigset_t,
-// ) -> c_int {
-//     PTHREAD_SIGMASK(how, set, oldset)
-// }
+static REAL_PTHREAD_CREATE: LazyFn<PthreadCreateFn> = LazyFn::new();
 
-// //
-// // pthread_kill
-// //
-// static PTHREAD_KILL: Lazy<extern "C" fn(pthread_t, c_int) -> c_int> = Lazy::new(|| unsafe {
-//     let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_kill").as_ptr());
-//     mem::transmute::<*mut c_void, extern "C" fn(pthread_t, c_int) -> c_int>(ptr)
-// });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_kill(thread: pthread_t, sig: c_int) -> c_int {
-//     PTHREAD_KILL(thread, sig)
-// }
-
-// //
-// // pthread_sigqueue
-// //
-// static PTHREAD_SIGQUEUE: Lazy<extern "C" fn(pthread_t, c_int, sigval) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_sigqueue").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(pthread_t, c_int, sigval) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_sigqueue(thread: pthread_t, sig: c_int, value: sigval) -> c_int {
-//     PTHREAD_SIGQUEUE(thread, sig, value)
-// }
-
-// //
-// // pthread_mutex_lock
-// //
-// static PTHREAD_MUTEX_LOCK: Lazy<extern "C" fn(*mut pthread_mutex_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_mutex_lock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_mutex_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
-//     PTHREAD_MUTEX_LOCK(mutex)
-// }
-
-// //
-// // pthread_mutex_trylock
-// //
-// static PTHREAD_MUTEX_TRYLOCK: Lazy<extern "C" fn(*mut pthread_mutex_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_mutex_trylock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_mutex_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int {
-//     PTHREAD_MUTEX_TRYLOCK(mutex)
-// }
-
-// //
-// // pthread_mutex_unlock
-// //
-// static PTHREAD_MUTEX_UNLOCK: Lazy<extern "C" fn(*mut pthread_mutex_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_mutex_unlock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_mutex_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
-//     PTHREAD_MUTEX_UNLOCK(mutex)
-// }
-
-// //
-// // pthread_cond_timedwait
-// //
-// static PTHREAD_COND_TIMEDWAIT: Lazy<
-//     extern "C" fn(*mut pthread_cond_t, *mut pthread_mutex_t, *const timespec) -> c_int,
-// > = Lazy::new(|| unsafe {
-//     let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_cond_timedwait").as_ptr());
-//     mem::transmute::<
-//         *mut c_void,
-//         extern "C" fn(*mut pthread_cond_t, *mut pthread_mutex_t, *const timespec) -> c_int,
-//     >(ptr)
-// });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_cond_timedwait(
-//     cond: *mut pthread_cond_t,
-//     mutex: *mut pthread_mutex_t,
-//     abstime: *const timespec,
-// ) -> c_int {
-//     PTHREAD_COND_TIMEDWAIT(cond, mutex, abstime)
-// }
-
-// //
-// // pthread_cond_wait
-// //
-// static PTHREAD_COND_WAIT: Lazy<extern "C" fn(*mut pthread_cond_t, *mut pthread_mutex_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_cond_wait").as_ptr());
-//         mem::transmute::<
-//             *mut c_void,
-//             extern "C" fn(*mut pthread_cond_t, *mut pthread_mutex_t) -> c_int,
-//         >(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_cond_wait(
-//     cond: *mut pthread_cond_t,
-//     mutex: *mut pthread_mutex_t,
-// ) -> c_int {
-//     PTHREAD_COND_WAIT(cond, mutex)
-// }
-
-// //
-// // pthread_cond_signal
-// //
-// static PTHREAD_COND_SIGNAL: Lazy<extern "C" fn(*mut pthread_cond_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_cond_signal").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_cond_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int {
-//     PTHREAD_COND_SIGNAL(cond)
-// }
-
-// //
-// // pthread_cond_broadcast
-// //
-// static PTHREAD_COND_BROADCAST: Lazy<extern "C" fn(*mut pthread_cond_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_cond_broadcast").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_cond_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut pthread_cond_t) -> c_int {
-//     PTHREAD_COND_BROADCAST(cond)
-// }
-
-// //
-// // pthread_rwlock_rdlock
-// //
-// static PTHREAD_RWLOCK_RDLOCK: Lazy<extern "C" fn(*mut pthread_rwlock_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_rwlock_rdlock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_rwlock_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_rwlock_rdlock(rwlock: *mut pthread_rwlock_t) -> c_int {
-//     PTHREAD_RWLOCK_RDLOCK(rwlock)
-// }
-
-// //
-// // pthread_rwlock_tryrdlock
-// //
-// static PTHREAD_RWLOCK_TRYRDLOCK: Lazy<extern "C" fn(*mut pthread_rwlock_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_rwlock_tryrdlock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_rwlock_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_rwlock_tryrdlock(rwlock: *mut pthread_rwlock_t) -> c_int {
-//     PTHREAD_RWLOCK_TRYRDLOCK(rwlock)
-// }
-
-// //
-// // pthread_rwlock_timedrdlock
-// //
-// static PTHREAD_RWLOCK_TIMEDRDLOCK: Lazy<
-//     extern "C" fn(*mut pthread_rwlock_t, *const timespec) -> c_int,
-// > = Lazy::new(|| unsafe {
-//     let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_rwlock_timedrdlock").as_ptr());
-//     mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_rwlock_t, *const timespec) -> c_int>(
-//         ptr,
-//     )
-// });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_rwlock_timedrdlock(
-//     rwlock: *mut pthread_rwlock_t,
-//     abstime: *const timespec,
-// ) -> c_int {
-//     PTHREAD_RWLOCK_TIMEDRDLOCK(rwlock, abstime)
-// }
-
-// //
-// // pthread_rwlock_wrlock
-// //
-// static PTHREAD_RWLOCK_WRLOCK: Lazy<extern "C" fn(*mut pthread_rwlock_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_rwlock_wrlock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_rwlock_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_rwlock_wrlock(rwlock: *mut pthread_rwlock_t) -> c_int {
-//     PTHREAD_RWLOCK_WRLOCK(rwlock)
-// }
-
-// //
-// // pthread_rwlock_trywrlock
-// //
-// static PTHREAD_RWLOCK_TRYWRLOCK: Lazy<extern "C" fn(*mut pthread_rwlock_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_rwlock_trywrlock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_rwlock_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_rwlock_trywrlock(rwlock: *mut pthread_rwlock_t) -> c_int {
-//     PTHREAD_RWLOCK_TRYWRLOCK(rwlock)
-// }
-
-// //
-// // pthread_rwlock_timedwrlock
-// //
-// static PTHREAD_RWLOCK_TIMEDWRLOCK: Lazy<
-//     extern "C" fn(*mut pthread_rwlock_t, *const timespec) -> c_int,
-// > = Lazy::new(|| unsafe {
-//     let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_rwlock_timedwrlock").as_ptr());
-//     mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_rwlock_t, *const timespec) -> c_int>(
-//         ptr,
-//     )
-// });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_rwlock_timedwrlock(
-//     rwlock: *mut pthread_rwlock_t,
-//     abstime: *const timespec,
-// ) -> c_int {
-//     PTHREAD_RWLOCK_TIMEDWRLOCK(rwlock, abstime)
-// }
-
-// //
-// // pthread_rwlock_unlock
-// //
-// static PTHREAD_RWLOCK_UNLOCK: Lazy<extern "C" fn(*mut pthread_rwlock_t) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!("pthread_rwlock_unlock").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(*mut pthread_rwlock_t) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_rwlock_unlock(rwlock: *mut pthread_rwlock_t) -> c_int {
-//     PTHREAD_RWLOCK_UNLOCK(rwlock)
-// }
-
-//
-// pthread_exit
-//
-static PTHREAD_EXIT: Once<extern "C" fn(*const c_void) -> !> = Once::new();
-/// Intercepts `pthread_exit` for profiler bookkeeping.
-///
-/// # Safety
-///
-/// This function is called from C code via the cdylib. The caller must ensure
-/// that `retval` is valid or null.
-///
-/// # Panics
-///
-/// Panics if dlsym cannot find the real `pthread_exit` function. This should
-/// only happen if the module is used incorrectly (not via LD_PRELOAD).
-#[no_mangle]
-#[allow(unreachable_pub)] // Exposed via C ABI, not Rust module visibility
-pub unsafe extern "C" fn pthread_exit(retval: *const c_void) -> ! {
-    // crate::experiment::EXPERIMENT.deregister_thread(pthread_self());
-
-    PTHREAD_EXIT.call_once(|| {
-        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_exit\0".as_ptr().cast::<i8>());
-        // dlsym returns NULL if RTLD_NEXT lookup fails (e.g., not loaded via LD_PRELOAD)
-        assert!(!ptr.is_null(), "dlsym failed to find pthread_exit - this module requires LD_PRELOAD");
-        mem::transmute::<*mut c_void, extern "C" fn(*const c_void) -> !>(ptr)
-    })(retval)
+/// Wrapper data passed to the thread start routine.
+struct ThreadWrapper {
+    real_start: extern "C" fn(*mut c_void) -> *mut c_void,
+    real_arg: *mut c_void,
 }
 
-// //
-// // pthread_join
-// //
-// static PTHREAD_JOIN: Lazy<extern "C" fn(pthread_t, *const *const c_void) -> c_int> =
-//     Lazy::new(|| unsafe {
-//         let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, cstr!(b"pthread_join").as_ptr());
-//         mem::transmute::<*mut c_void, extern "C" fn(pthread_t, *const *const c_void) -> c_int>(ptr)
-//     });
-// #[no_mangle]
-// pub unsafe extern "C" fn pthread_join(thread: pthread_t, retval: *const *const c_void) -> c_int {
-//     PTHREAD_JOIN(thread, retval)
-// }
+/// Wrapper function that initializes profiling before calling the user's thread function.
+extern "C" fn thread_start_wrapper(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: arg is a Box<ThreadWrapper> that we created in pthread_create
+    let wrapper = unsafe { Box::from_raw(arg.cast::<ThreadWrapper>()) };
 
-//
-// pthread_create
-//
-static PTHREAD_CREATE: Once<
-    extern "C" fn(
-        thread: *const pthread_t,
-        attr: *const pthread_attr_t,
-        start_routine: unsafe extern "C" fn(*const c_void),
-        arg: *const c_void,
-    ) -> c_int,
-> = Once::new();
+    // Register this thread with the profiler
+    // This sets up per-thread sampling and delay accumulation
+    crate::experiment::register_thread(unsafe { libc::pthread_self() });
+
+    // Start profiling for this thread if profiling is active
+    if crate::is_profiling_active() {
+        // Ignore errors - profiling degradation is acceptable
+        let _ = crate::start_profiling();
+    }
+
+    // Call the real thread function
+    // Cleanup happens automatically via thread-local storage Drop
+    (wrapper.real_start)(wrapper.real_arg)
+}
+
 /// Intercepts `pthread_create` to register new threads with the profiler.
+///
+/// The new thread will automatically be set up for profiling before the
+/// user's start routine runs.
 ///
 /// # Safety
 ///
-/// This function is called from C code via the cdylib. All pointer parameters
-/// must be valid according to `pthread_create`'s contract.
-///
-/// # Panics
-///
-/// Panics if dlsym cannot find the real `pthread_create` function. This should
-/// only happen if the module is used incorrectly (not via LD_PRELOAD).
+/// All pointer parameters must be valid according to `pthread_create`'s contract.
 #[no_mangle]
-#[allow(unreachable_pub)] // Exposed via C ABI, not Rust module visibility
+#[allow(unreachable_pub)] // Exposed via C ABI
 pub unsafe extern "C" fn pthread_create(
-    thread: *const pthread_t,
+    thread: *mut pthread_t,
     attr: *const pthread_attr_t,
-    start_routine: unsafe extern "C" fn(*const c_void),
-    arg: *const c_void,
+    start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+    arg: *mut c_void,
 ) -> c_int {
-    crate::experiment::get_instance().register_thread(pthread_self());
-    PTHREAD_CREATE.call_once(|| {
-        let ptr: *mut c_void = libc::dlsym(RTLD_NEXT, b"pthread_create\0".as_ptr().cast::<i8>());
-        // dlsym returns NULL if RTLD_NEXT lookup fails (e.g., not loaded via LD_PRELOAD)
-        assert!(!ptr.is_null(), "dlsym failed to find pthread_create - this module requires LD_PRELOAD");
-        mem::transmute::<
-            *mut c_void,
-            extern "C" fn(
-                *const pthread_t,
-                *const pthread_attr_t,
-                unsafe extern "C" fn(*const c_void),
-                *const c_void,
-            ) -> c_int,
-        >(ptr)
-    })(thread, attr, start_routine, arg)
+    let Some(real_fn) = REAL_PTHREAD_CREATE.get(b"pthread_create\0") else {
+        // Can't resolve real function - return error
+        return libc::EINVAL;
+    };
+
+    // Wrap the thread start function to intercept thread initialization
+    let wrapper = Box::new(ThreadWrapper {
+        real_start: start_routine,
+        real_arg: arg,
+    });
+
+    real_fn(
+        thread,
+        attr,
+        thread_start_wrapper,
+        Box::into_raw(wrapper).cast::<c_void>(),
+    )
+}
+
+type PthreadExitFn = unsafe extern "C" fn(*mut c_void) -> !;
+static REAL_PTHREAD_EXIT: LazyFn<PthreadExitFn> = LazyFn::new();
+
+/// Intercepts `pthread_exit` to deregister threads from the profiler.
+///
+/// # Safety
+///
+/// `retval` must be valid or null per `pthread_exit`'s contract.
+#[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI
+pub unsafe extern "C" fn pthread_exit(retval: *mut c_void) -> ! {
+    // Deregister this thread from the profiler
+    crate::experiment::deregister_thread(libc::pthread_self());
+
+    // Call the real pthread_exit
+    match REAL_PTHREAD_EXIT.get(b"pthread_exit\0") {
+        Some(real_fn) => real_fn(retval),
+        None => {
+            // Last resort - shouldn't happen but we need to exit somehow
+            libc::_exit(1);
+        }
+    }
+}
+
+// =============================================================================
+// MUTEX OPERATIONS
+// =============================================================================
+
+type PthreadMutexLockFn = unsafe extern "C" fn(*mut pthread_mutex_t) -> c_int;
+static REAL_PTHREAD_MUTEX_LOCK: LazyFn<PthreadMutexLockFn> = LazyFn::new();
+
+/// Intercepts `pthread_mutex_lock` to inject delays before acquiring.
+///
+/// Delays are consumed BEFORE acquiring the mutex to:
+/// 1. Not affect lock acquisition order
+/// 2. Maintain program correctness
+/// 3. Simulate the thread being slower at reaching this point
+///
+/// # Safety
+///
+/// `mutex` must be a valid, initialized mutex.
+#[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI
+pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
+    // Consume any pending delay BEFORE acquiring the lock
+    crate::consume_pending_delay();
+
+    match REAL_PTHREAD_MUTEX_LOCK.get(b"pthread_mutex_lock\0") {
+        Some(real_fn) => real_fn(mutex),
+        None => libc::EINVAL,
+    }
+}
+
+// =============================================================================
+// CONDITION VARIABLE OPERATIONS
+// =============================================================================
+
+type PthreadCondWaitFn = unsafe extern "C" fn(*mut pthread_cond_t, *mut pthread_mutex_t) -> c_int;
+static REAL_PTHREAD_COND_WAIT: LazyFn<PthreadCondWaitFn> = LazyFn::new();
+
+/// Intercepts `pthread_cond_wait` to inject delays before waiting.
+///
+/// # Safety
+///
+/// `cond` and `mutex` must be valid and properly initialized.
+#[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI
+pub unsafe extern "C" fn pthread_cond_wait(
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+) -> c_int {
+    // Consume delay before waiting
+    crate::consume_pending_delay();
+
+    match REAL_PTHREAD_COND_WAIT.get(b"pthread_cond_wait\0") {
+        Some(real_fn) => real_fn(cond, mutex),
+        None => libc::EINVAL,
+    }
+}
+
+type PthreadCondTimedwaitFn =
+    unsafe extern "C" fn(*mut pthread_cond_t, *mut pthread_mutex_t, *const timespec) -> c_int;
+static REAL_PTHREAD_COND_TIMEDWAIT: LazyFn<PthreadCondTimedwaitFn> = LazyFn::new();
+
+/// Intercepts `pthread_cond_timedwait` to inject delays before waiting.
+///
+/// # Safety
+///
+/// `cond`, `mutex`, and `abstime` must be valid and properly initialized.
+#[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI
+pub unsafe extern "C" fn pthread_cond_timedwait(
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
+    abstime: *const timespec,
+) -> c_int {
+    // Consume delay before waiting
+    crate::consume_pending_delay();
+
+    match REAL_PTHREAD_COND_TIMEDWAIT.get(b"pthread_cond_timedwait\0") {
+        Some(real_fn) => real_fn(cond, mutex, abstime),
+        None => libc::EINVAL,
+    }
+}
+
+// =============================================================================
+// READER-WRITER LOCK OPERATIONS
+// =============================================================================
+
+type PthreadRwlockRdlockFn = unsafe extern "C" fn(*mut pthread_rwlock_t) -> c_int;
+static REAL_PTHREAD_RWLOCK_RDLOCK: LazyFn<PthreadRwlockRdlockFn> = LazyFn::new();
+
+/// Intercepts `pthread_rwlock_rdlock` to inject delays before acquiring.
+///
+/// # Safety
+///
+/// `rwlock` must be a valid, initialized reader-writer lock.
+#[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI
+pub unsafe extern "C" fn pthread_rwlock_rdlock(rwlock: *mut pthread_rwlock_t) -> c_int {
+    crate::consume_pending_delay();
+
+    match REAL_PTHREAD_RWLOCK_RDLOCK.get(b"pthread_rwlock_rdlock\0") {
+        Some(real_fn) => real_fn(rwlock),
+        None => libc::EINVAL,
+    }
+}
+
+type PthreadRwlockWrlockFn = unsafe extern "C" fn(*mut pthread_rwlock_t) -> c_int;
+static REAL_PTHREAD_RWLOCK_WRLOCK: LazyFn<PthreadRwlockWrlockFn> = LazyFn::new();
+
+/// Intercepts `pthread_rwlock_wrlock` to inject delays before acquiring.
+///
+/// # Safety
+///
+/// `rwlock` must be a valid, initialized reader-writer lock.
+#[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI
+pub unsafe extern "C" fn pthread_rwlock_wrlock(rwlock: *mut pthread_rwlock_t) -> c_int {
+    crate::consume_pending_delay();
+
+    match REAL_PTHREAD_RWLOCK_WRLOCK.get(b"pthread_rwlock_wrlock\0") {
+        Some(real_fn) => real_fn(rwlock),
+        None => libc::EINVAL,
+    }
+}
+
+// =============================================================================
+// BARRIER OPERATIONS (Linux only)
+// =============================================================================
+
+#[cfg(target_os = "linux")]
+type PthreadBarrierWaitFn = unsafe extern "C" fn(*mut libc::pthread_barrier_t) -> c_int;
+#[cfg(target_os = "linux")]
+static REAL_PTHREAD_BARRIER_WAIT: LazyFn<PthreadBarrierWaitFn> = LazyFn::new();
+
+/// Intercepts `pthread_barrier_wait` to inject delays before waiting.
+///
+/// # Safety
+///
+/// `barrier` must be a valid, initialized barrier.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+#[allow(unreachable_pub)] // Exposed via C ABI
+pub unsafe extern "C" fn pthread_barrier_wait(barrier: *mut libc::pthread_barrier_t) -> c_int {
+    crate::consume_pending_delay();
+
+    match REAL_PTHREAD_BARRIER_WAIT.get(b"pthread_barrier_wait\0") {
+        Some(real_fn) => real_fn(barrier),
+        None => libc::EINVAL,
+    }
 }
