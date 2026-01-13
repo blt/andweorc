@@ -25,7 +25,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
-use andweorc::{init, progress, run_experiments, start_profiling};
+use andweorc::{init, progress, run_experiments};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -40,23 +40,20 @@ struct WorkItem {
     data: Vec<u8>,
 }
 
-/// Stage 1: Parse - Fast (~1ms)
+/// Stage 1: Parse - Very fast (minimal work)
 fn parse_stage(item_id: u64) -> WorkItem {
-    // Simulate parsing work
+    // Just generate the item - minimal work
     let mut data = Vec::with_capacity(1000);
     for i in 0..1000 {
         data.push((i as u8).wrapping_add(item_id as u8));
     }
-
-    // Small busy-wait to simulate ~1ms of work
-    busy_wait_micros(1000);
 
     progress!("parse_done");
 
     WorkItem { id: item_id, data }
 }
 
-/// Stage 2: Transform - SLOW (~10ms) - THIS IS THE BOTTLENECK
+/// Stage 2: Transform - SLOW (100K iterations) - THIS IS THE BOTTLENECK
 fn transform_stage(mut item: WorkItem) -> WorkItem {
     // Simulate heavy transformation work
     for _ in 0..10 {
@@ -65,30 +62,43 @@ fn transform_stage(mut item: WorkItem) -> WorkItem {
         }
     }
 
-    // Busy-wait to simulate ~10ms of work (THE BOTTLENECK)
-    busy_wait_micros(10_000);
+    // Heavy CPU work - THIS IS THE BOTTLENECK (10x more work)
+    let _ = transform_compute();
 
     progress!("transform_done");
 
     item
 }
 
-/// Stage 3: Serialize - Fast (~1ms)
+/// Stage 3: Serialize - Very fast (minimal work)
 fn serialize_stage(item: WorkItem) -> Vec<u8> {
-    // Simulate serialization
+    // Just serialize the item - minimal work
     let mut output = Vec::with_capacity(item.data.len() + 8);
     output.extend_from_slice(&item.id.to_le_bytes());
     output.extend_from_slice(&item.data);
-
-    // Small busy-wait to simulate ~1ms of work
-    busy_wait_micros(1000);
 
     progress!("serialize_done");
 
     output
 }
 
+/// Heavy CPU work for transform stage (THIS IS THE BOTTLENECK).
+/// All CPU-intensive work happens here.
+#[inline(never)]
+fn transform_compute() -> u64 {
+    let mut hash: u64 = 0x517c_c1b7_2722_0a95;
+    for i in 0..100_000_u64 {
+        // This is where 90%+ of CPU time should be spent
+        hash ^= i;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+        hash = hash.rotate_left(17);
+    }
+    black_box(hash)
+}
+
 /// Busy-wait for approximately the given number of microseconds
+/// (kept for reference, but compute_work is preferred for profiling)
+#[allow(dead_code)]
 fn busy_wait_micros(micros: u64) {
     let start = Instant::now();
     let target = Duration::from_micros(micros);
@@ -108,11 +118,9 @@ fn run_pipeline(num_items: u64, running: Arc<AtomicBool>, items_processed: Arc<A
     let items_clone = Arc::clone(&items_processed);
 
     // Stage 1: Parser thread
+    // Note: When using LD_PRELOAD, profiling is automatically started for new threads
+    // via the pthread_create interceptor. No need to call start_profiling() explicitly.
     let parser = thread::spawn(move || {
-        if let Err(e) = start_profiling() {
-            eprintln!("Parser: failed to start profiling: {e}");
-        }
-
         let mut item_id = 0u64;
         while running_clone.load(Ordering::Relaxed) && item_id < num_items {
             let item = parse_stage(item_id);
@@ -129,10 +137,6 @@ fn run_pipeline(num_items: u64, running: Arc<AtomicBool>, items_processed: Arc<A
 
     // Stage 2: Transformer thread (THE BOTTLENECK)
     let transformer = thread::spawn(move || {
-        if let Err(e) = start_profiling() {
-            eprintln!("Transformer: failed to start profiling: {e}");
-        }
-
         let mut count = 0u64;
         while let Ok(item) = parse_rx.recv() {
             if !running_clone.load(Ordering::Relaxed) {
@@ -150,10 +154,6 @@ fn run_pipeline(num_items: u64, running: Arc<AtomicBool>, items_processed: Arc<A
 
     // Stage 3: Serializer thread
     let serializer = thread::spawn(move || {
-        if let Err(e) = start_profiling() {
-            eprintln!("Serializer: failed to start profiling: {e}");
-        }
-
         let mut count = 0u64;
         while let Ok(item) = transform_rx.recv() {
             let serialized = serialize_stage(item);
@@ -189,21 +189,20 @@ fn main() {
     println!("This example demonstrates causal profiling on a multi-stage pipeline.");
     println!("The Transform stage is intentionally 10x slower than other stages.\n");
     println!("Stage timings:");
-    println!("  Parse:     ~1ms per item");
-    println!("  Transform: ~10ms per item (BOTTLENECK)");
-    println!("  Serialize: ~1ms per item\n");
+    println!("  Parse:     Minimal work (just generate items)");
+    println!("  Transform: 100K hash iterations (BOTTLENECK - ALL CPU work here)");
+    println!("  Serialize: Minimal work (just copy data)\n");
 
     // Initialize profiler
     if let Err(e) = init() {
         eprintln!("Failed to initialize profiler: {e}");
     }
 
-    let num_items = 200u64;
     let running = Arc::new(AtomicBool::new(true));
     let items_processed = Arc::new(AtomicU64::new(0));
 
-    // Phase 1: Warmup
-    println!("Phase 1: Warmup run (no profiling experiments)...");
+    // Phase 1: Warmup (brief, just to get samples started)
+    println!("Phase 1: Brief warmup...");
     let start = Instant::now();
 
     run_pipeline(50, Arc::clone(&running), Arc::clone(&items_processed));
@@ -222,19 +221,25 @@ fn main() {
 
     // Phase 2: Run with experiments
     println!("Phase 2: Running with causal profiling experiments...");
-    println!("(Main thread orchestrates experiments while workers process items)\n");
+    println!("(Main thread orchestrates experiments while workers process items)");
+    println!("This will take several minutes - the pipeline runs continuously\n");
 
     let running_clone = Arc::clone(&running);
     let items_clone = Arc::clone(&items_processed);
 
-    // Start pipeline in background
+    // Start pipeline in background - runs CONTINUOUSLY until signaled to stop
+    // This is critical: the workload must keep producing progress points
+    // for the entire duration of the experiment loop
     let pipeline = thread::spawn(move || {
-        run_pipeline(num_items, running_clone, items_clone);
+        run_pipeline(u64::MAX, running_clone, items_clone);
     });
 
     // Run experiments on the main thread, measuring transform_done throughput
     // (this is the bottleneck stage, so its throughput = overall throughput)
     let _ = run_experiments("transform_done");
+
+    // Signal pipeline to stop now that experiments are done
+    running.store(false, Ordering::Release);
 
     // Wait for pipeline to finish
     pipeline.join().unwrap();
