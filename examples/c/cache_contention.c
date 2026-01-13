@@ -32,24 +32,63 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
-/* Include andweorc header for progress points */
-#include "../../andweorc/include/andweorc.h"
+/* Include dlfcn for runtime symbol lookup */
+#include <dlfcn.h>
 
 /*
- * Weak symbol stubs for andweorc functions.
- * These allow the program to link without the profiler library.
- * When run with LD_PRELOAD, the real implementations override these.
+ * Function pointers for andweorc functions.
+ * These are resolved at runtime via dlsym to support LD_PRELOAD.
+ * Weak symbols don't work because they're resolved at link time.
  */
-__attribute__((weak))
-void andweorc_progress(const char* name) {
-    (void)name; /* No-op when profiler not loaded */
+typedef void (*andweorc_progress_fn)(const char*);
+typedef void (*andweorc_run_experiments_fn)(const char*);
+
+static andweorc_progress_fn real_andweorc_progress = NULL;
+static andweorc_run_experiments_fn real_andweorc_run_experiments = NULL;
+static int andweorc_initialized = 0;
+
+/* Initialize andweorc function pointers via dlsym */
+static void init_andweorc(void) {
+    if (andweorc_initialized) return;
+    andweorc_initialized = 1;
+
+    /* Look up symbols from currently loaded libraries (including LD_PRELOAD) */
+    real_andweorc_progress = (andweorc_progress_fn)dlsym(RTLD_DEFAULT, "andweorc_progress");
+    real_andweorc_run_experiments = (andweorc_run_experiments_fn)dlsym(RTLD_DEFAULT, "andweorc_run_experiments");
+
+    if (real_andweorc_progress) {
+        printf("[cache_contention] Found andweorc_progress via dlsym\n");
+    } else {
+        printf("[cache_contention] andweorc_progress not found, using no-op\n");
+    }
+    if (real_andweorc_run_experiments) {
+        printf("[cache_contention] Found andweorc_run_experiments via dlsym\n");
+    } else {
+        printf("[cache_contention] andweorc_run_experiments not found, using fallback\n");
+    }
 }
 
-__attribute__((weak))
-void andweorc_progress_named(const char* file, int line) {
-    (void)file;
-    (void)line;
+/* Wrapper that calls real function if available, or no-op */
+static void andweorc_progress_wrapper(const char* name) {
+    if (!andweorc_initialized) init_andweorc();
+    if (real_andweorc_progress) {
+        real_andweorc_progress(name);
+    }
 }
+
+/* Wrapper for run_experiments - falls back to 5s sleep */
+static void andweorc_run_experiments_wrapper(const char* name) {
+    if (!andweorc_initialized) init_andweorc();
+    if (real_andweorc_run_experiments) {
+        real_andweorc_run_experiments(name);
+    } else {
+        printf("[cache_contention] Profiler not loaded, sleeping 5s...\n");
+        sleep(5);
+    }
+}
+
+/* Macro to use the wrapper */
+#define ANDWEORC_PROGRESS_NAMED(name) andweorc_progress_wrapper(name)
 
 /* Configuration */
 #define NUM_BUCKETS 16          /* Small number to increase contention */
@@ -282,9 +321,10 @@ int main(void) {
         pthread_create(&threads[i], NULL, worker_thread, &thread_ids[i]);
     }
 
-    /* Run for a fixed duration (5 seconds) */
-    printf("Running for 5 seconds...\n");
-    sleep(5);
+    /* Run causal profiling experiments (or sleep 5s if profiler not loaded) */
+    printf("Running causal profiling experiments (this may take several minutes)...\n");
+    printf("Workers will continue running until experiments complete.\n\n");
+    andweorc_run_experiments_wrapper("cache_op_done");
 
     /* Signal threads to stop */
     atomic_store(&g_running, 0);

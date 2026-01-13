@@ -102,6 +102,48 @@ void andweorc_begin(const char* name);
  */
 void andweorc_end(const char* name);
 
+/**
+ * Runs the causal profiling experiment loop.
+ *
+ * This function blocks and runs experiments, measuring throughput at the
+ * specified progress point while testing virtual speedups at various
+ * instruction pointers. The workload should continue running in other
+ * threads while this function executes.
+ *
+ * @param progress_point_name Name of the progress point to measure throughput.
+ *                            Must match a name used with andweorc_progress().
+ *
+ * NOTE: This function typically runs for several minutes. The workload must
+ *       continue producing progress points for the entire duration.
+ *
+ * Example:
+ *   int main(void) {
+ *       // Start workload in background threads
+ *       start_workers();
+ *
+ *       // Run experiments (blocks until complete)
+ *       andweorc_run_experiments("items_processed");
+ *
+ *       // Signal workers to stop
+ *       stop_workers();
+ *       return 0;
+ *   }
+ */
+void andweorc_run_experiments(const char* progress_point_name);
+
+/**
+ * Initializes the profiler (optional).
+ *
+ * When using LD_PRELOAD, the profiler is initialized automatically.
+ * This function is provided for cases where you want to initialize
+ * the profiler directly from your code.
+ *
+ * @return 0 on success, non-zero on failure.
+ *
+ * NOTE: This function is typically not needed when using LD_PRELOAD.
+ */
+int andweorc_init(void);
+
 /*
  * Convenience Macros
  */

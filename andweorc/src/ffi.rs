@@ -549,6 +549,79 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Runs the causal profiling experiment loop.
+///
+/// This function blocks and runs experiments, measuring throughput at the
+/// specified progress point while testing virtual speedups at various IPs.
+///
+/// # Parameters
+///
+/// * `progress_point_name` - Name of the progress point to measure throughput.
+///
+/// # Thread Safety
+///
+/// This function should be called from the main thread while worker threads
+/// continue producing progress points.
+///
+/// # Example
+///
+/// ```c
+/// int main(void) {
+///     start_workers();
+///     andweorc_run_experiments("items_done");
+///     stop_workers();
+///     return 0;
+/// }
+/// ```
+#[no_mangle]
+#[allow(unreachable_pub)]
+pub unsafe extern "C" fn andweorc_run_experiments(progress_point_name: *const c_char) {
+    if !crate::is_profiling_active() {
+        libc_print::libc_eprintln!(
+            "[andweorc] run_experiments called but profiling is not active"
+        );
+        return;
+    }
+
+    let Some(name_str) = cstr_to_str_bounded(progress_point_name) else {
+        libc_print::libc_eprintln!(
+            "[andweorc] run_experiments: invalid progress point name"
+        );
+        return;
+    };
+
+    libc_print::libc_println!(
+        "[andweorc] starting experiments for progress point: {name_str}"
+    );
+
+    // Run experiments - this blocks until complete
+    let _ = crate::run_experiments(name_str);
+
+    libc_print::libc_println!("[andweorc] experiments complete");
+}
+
+/// Initializes the profiler.
+///
+/// When using LD_PRELOAD, the profiler is initialized automatically.
+/// This function is provided for cases where you want to initialize
+/// the profiler directly from your code.
+///
+/// # Returns
+///
+/// 0 on success, non-zero on failure.
+///
+/// # Thread Safety
+///
+/// Should be called once from the main thread before starting other threads.
+#[no_mangle]
+#[allow(unreachable_pub)]
+pub unsafe extern "C" fn andweorc_init() -> c_int {
+    match crate::init() {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
 /// Gets the current monotonic time in nanoseconds.
 fn monotonic_nanos() -> u64 {
     let mut ts = libc::timespec {
