@@ -17,7 +17,7 @@ libc = { version = "0.2", default-features = false }
 libc-print = { version = "0.1", default-features = false }
 signal-hook = { version = "0.3", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
-perf-event = { git = "https://github.com/blt/perf-event", rev = "2b55339d0ff6440b0b7156c8d16d9dc896a4372f", default-features = false }
+perf-event = { git = "https://github.com/blt/perf-event", branch = "main", default-features = false }
 andweorc-macros = { path = "../andweorc-macros" }
 backtrace = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }

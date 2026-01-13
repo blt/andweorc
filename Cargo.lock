@@ -688,7 +688,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "perf-event"
 version = "0.4.2"
-source = "git+https://github.com/blt/perf-event?rev=2b55339d0ff6440b0b7156c8d16d9dc896a4372f#2b55339d0ff6440b0b7156c8d16d9dc896a4372f"
+source = "git+https://github.com/blt/perf-event?branch=main#f01f59a2d7db245f0441f51fbbb8878481205598"
 dependencies = [
  "byte",
  "libc",
