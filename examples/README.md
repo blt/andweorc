@@ -255,6 +255,38 @@ sudo setcap cap_perfmon=ep ./your_binary
 - **Impact ~0**: Not on critical path
 - **Impact < 0**: Optimizing would INCREASE contention (key insight!)
 
+### Barrier synchronization and negative impact
+
+Barrier-synchronized workloads show counterintuitive causal patterns that are actually
+**correct and valuable**. Here's why:
+
+**How causal profiling works:**
+1. Select a code location (instruction pointer)
+2. Delay threads that are NOT at that location
+3. Measure throughput change
+4. If throughput increases with delay, speeding up that code would help
+
+**What happens with barriers:**
+1. All threads must reach the barrier before any can proceed
+2. When we "virtually speed up" code by delaying other threads:
+   - The selected thread finishes faster
+   - But it waits at the barrier for delayed threads
+   - Net result: iteration takes LONGER (negative correlation)
+
+**What negative impact tells you:**
+- "Optimizing this specific code won't improve performance"
+- "The problem is the synchronization pattern, not the code efficiency"
+- The fix is to REPLACE the barrier, not optimize the hot code
+
+**Real-world example from Coz paper:**
+- PARSEC's fluidanimate and streamcluster used custom spin barriers
+- Traditional profilers showed the spin-wait as a hot spot
+- **Wrong fix:** Optimize the spin-wait loop
+- **Right fix:** Replace spin barrier with pthread_barrier
+- Result: 37.5% and 68.4% speedups respectively
+
+This is a key insight of causal profiling that traditional profilers cannot provide.
+
 ## References
 
 - [Coz Paper (SOSP 2015)](https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/printable/090-curtsinger.pdf)

@@ -27,9 +27,9 @@ ANDWEORC_LIB ?= ../../target/release/libandweorc.so
 INCLUDES = -I../../andweorc/include
 
 # Targets
-TARGETS = cache_contention producer_consumer barrier_sync
+TARGETS = cache_contention producer_consumer barrier_sync dedup_hash
 
-.PHONY: all clean run-cache run-producer run-barrier run-all
+.PHONY: all clean run-cache run-producer run-barrier run-dedup run-all
 
 all: $(TARGETS)
 
@@ -40,6 +40,9 @@ producer_consumer: producer_consumer.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 barrier_sync: barrier_sync.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+dedup_hash: dedup_hash.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 clean:
@@ -58,6 +61,10 @@ run-barrier: barrier_sync
 	@echo "=== Running barrier_sync with causal profiling ==="
 	LD_PRELOAD=$(ANDWEORC_LIB) ANDWEORC_ENABLED=1 ./barrier_sync
 
+run-dedup: dedup_hash
+	@echo "=== Running dedup_hash with causal profiling ==="
+	LD_PRELOAD=$(ANDWEORC_LIB) ANDWEORC_ENABLED=1 ./dedup_hash
+
 # Run all examples sequentially
 run-all: $(TARGETS)
 	@echo "=== Running all examples with causal profiling ==="
@@ -70,6 +77,9 @@ run-all: $(TARGETS)
 	@echo ""
 	@echo "--- Barrier Synchronization (PARSEC-inspired) ---"
 	LD_PRELOAD=$(ANDWEORC_LIB) ANDWEORC_ENABLED=1 ./barrier_sync
+	@echo ""
+	@echo "--- Dedup Hash Table (coz paper inspired) ---"
+	LD_PRELOAD=$(ANDWEORC_LIB) ANDWEORC_ENABLED=1 ./dedup_hash
 
 # Run without profiling (for comparison)
 run-baseline: $(TARGETS)
@@ -79,3 +89,5 @@ run-baseline: $(TARGETS)
 	./producer_consumer
 	@echo ""
 	./barrier_sync
+	@echo ""
+	./dedup_hash
