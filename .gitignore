@@ -1,1 +1,12 @@
 /target
+
+# C example binaries
+examples/c/cache_contention
+examples/c/cache_contention_coz
+examples/c/producer_consumer
+examples/c/barrier_sync
+
+# Profiler output files
+*.coz
+profile.coz
+perf.data
