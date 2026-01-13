@@ -97,6 +97,18 @@ Signal handlers have severe restrictions. Code in signal handlers must:
 
 ## Development Workflow
 
+### Issue Tracking (beads)
+
+This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --status in_progress  # Claim work
+bd close <id>         # Complete work
+bd sync               # Sync with git
+```
+
 ### Required Before Every Commit
 
 ```bash
@@ -117,6 +129,28 @@ This runs all checks. Do not run individual cargo commands—use CI scripts:
 - Small, focused commits
 - Descriptive commit messages explaining WHY
 - Reference issues where applicable
+
+### Session Completion
+
+When ending a work session, complete ALL steps below. Work is NOT complete until
+`git push` succeeds.
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **Push to remote** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**Critical**: Work is NOT complete until `git push` succeeds. Never stop before
+pushing—that leaves work stranded locally.
 
 ## Architecture
 
