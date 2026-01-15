@@ -28,6 +28,7 @@
 mod pthread;
 mod real;
 mod signal;
+pub(crate) mod trigger;
 
 /// Checks if the `ANDWEORC_ENABLED` environment variable is set to "1".
 ///
@@ -88,6 +89,13 @@ static INIT: extern "C" fn() = {
                 // SAFETY: _exit is async-signal-safe
                 unsafe { libc::_exit(1) };
             }
+        }
+
+        // Register SIGUSR1 handler for signal-based experiment triggering
+        // This allows external programs to trigger experiments via `kill -USR1 <pid>`
+        if let Err(e) = trigger::register_sigusr1_handler() {
+            libc_print::libc_eprintln!("[andweorc] WARNING: failed to register SIGUSR1 handler: {e}");
+            // Continue anyway - the profiler can still work via explicit API calls
         }
     }
     init

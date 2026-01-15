@@ -127,12 +127,22 @@ impl Progress {
     /// threads that hit the selected code during profiling accumulate delay
     /// debt which is "paid" at progress points.
     ///
+    /// # Signal-Based Experiment Trigger
+    ///
+    /// If a SIGUSR1 signal was received, this will trigger the experiment
+    /// runner to start full causal profiling. This enables profiling of
+    /// external programs that can't be modified.
+    ///
     /// # Generation Counter
     ///
     /// Uses a generation counter to detect concurrent `reset()` calls. If a reset
     /// occurs during `note_visit()`, the timestamp updates are skipped to avoid
     /// corrupted throughput measurements. The visit count is still incremented.
     pub fn note_visit(&self) {
+        // Check for signal-triggered experiment request
+        // This is the deferred execution point for SIGUSR1-triggered experiments
+        crate::posix::trigger::check_and_run_experiments();
+
         // Consume any pending delay before measuring throughput.
         // This implements the Coz virtual speedup: threads hitting the selected
         // code are delayed at progress points, simulating what would happen if

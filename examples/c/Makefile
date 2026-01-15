@@ -23,9 +23,9 @@ ANDWEORC_LIB ?= ../../target/release/libandweorc.so
 INCLUDES = -I../../andweorc/include
 
 # Targets - only examples that do FULL CAUSAL PROFILING
-TARGETS = cache_contention dedup_hash
+TARGETS = cache_contention dedup_hash signal_trigger
 
-.PHONY: all clean run-cache run-dedup run-all
+.PHONY: all clean run-cache run-dedup run-signal run-all
 
 all: $(TARGETS)
 
@@ -33,6 +33,9 @@ cache_contention: cache_contention.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 dedup_hash: dedup_hash.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+signal_trigger: signal_trigger.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 clean:
@@ -46,6 +49,10 @@ run-cache: cache_contention
 run-dedup: dedup_hash
 	@echo "=== Running dedup_hash with causal profiling ==="
 	LD_PRELOAD=$(ANDWEORC_LIB) ANDWEORC_ENABLED=1 ./dedup_hash
+
+run-signal: signal_trigger
+	@echo "=== Running signal_trigger with causal profiling (auto-trigger) ==="
+	LD_PRELOAD=$(ANDWEORC_LIB) ANDWEORC_ENABLED=1 ANDWEORC_EXPERIMENT_TARGET="work_done" ./signal_trigger --auto
 
 # Run all examples sequentially
 run-all: $(TARGETS)

@@ -144,6 +144,56 @@ void andweorc_run_experiments(const char* progress_point_name);
  */
 int andweorc_init(void);
 
+/**
+ * Registers the SIGUSR1 signal handler for external experiment triggering.
+ *
+ * After calling this function, you can trigger causal profiling experiments
+ * by sending SIGUSR1 to the process: `kill -USR1 <pid>`
+ *
+ * The experiment will run at the next progress point visit and measure
+ * throughput against the progress point specified by the environment
+ * variable ANDWEORC_EXPERIMENT_TARGET (defaults to "default").
+ *
+ * @return 0 on success, non-zero on failure.
+ *
+ * NOTE: When using LD_PRELOAD, this is registered automatically.
+ *
+ * Example:
+ *   int main(void) {
+ *       andweorc_init();
+ *       andweorc_register_signal_trigger();
+ *
+ *       start_workers();  // Workers call andweorc_progress()
+ *       // Now `kill -USR1 <pid>` will trigger experiments
+ *       while (running) {
+ *           sleep(1);
+ *       }
+ *       stop_workers();
+ *       return 0;
+ *   }
+ */
+int andweorc_register_signal_trigger(void);
+
+/**
+ * Manually triggers causal profiling experiments.
+ *
+ * This is equivalent to sending SIGUSR1 to the process but can be called
+ * directly from code. The experiment will run immediately and measure
+ * throughput against the specified progress point.
+ *
+ * @param progress_point_name Name of the progress point to measure throughput.
+ *                            If NULL, uses ANDWEORC_EXPERIMENT_TARGET or "default".
+ *
+ * NOTE: This function blocks while running experiments (several minutes).
+ *       The workload must continue producing progress points in other threads.
+ *
+ * Example:
+ *   // Run experiments programmatically after warmup
+ *   sleep(10);  // Let system warm up
+ *   andweorc_trigger_experiments("items_processed");
+ */
+void andweorc_trigger_experiments(const char* progress_point_name);
+
 /*
  * Convenience Macros
  */

@@ -196,6 +196,74 @@ speed up" code by delaying other threads:
 - **Right fix:** Replace spin barrier with pthread_barrier
 - Result: 37.5% and 68.4% speedups respectively
 
+## Signal-Based Experiment Triggering
+
+For profiling programs you can't modify, andweorc supports triggering experiments
+via SIGUSR1. This enables causal profiling of third-party applications.
+
+### How It Works
+
+1. Run the target program with `LD_PRELOAD` and `ANDWEORC_ENABLED=1`
+2. The program must have progress points (via intercepted pthread functions or explicit calls)
+3. Send `SIGUSR1` to trigger experiments: `kill -USR1 <pid>`
+4. Experiments run at the next progress point visit
+
+### Environment Variables
+
+- `ANDWEORC_EXPERIMENT_TARGET`: Name of progress point to measure throughput (default: "default")
+
+### Example: Profiling Any Program
+
+```bash
+# Terminal 1: Start the program with profiling enabled
+LD_PRELOAD=/path/to/libandweorc.so ANDWEORC_ENABLED=1 \
+  ANDWEORC_EXPERIMENT_TARGET="request_done" ./my_server
+
+# Terminal 2: Let it warm up, then trigger experiments
+sleep 30  # Warmup period
+kill -USR1 $(pgrep my_server)
+# Watch terminal 1 for profiling output
+```
+
+### Example: Profiling a Rust Benchmark
+
+```bash
+# Terminal 1: Run the dedup hash example
+LD_PRELOAD=../../target/release/libandweorc.so ANDWEORC_ENABLED=1 \
+  ANDWEORC_EXPERIMENT_TARGET="dedup_done" ./dedup_hash &
+PID=$!
+
+# Wait for warmup, then trigger experiments via signal
+sleep 5
+kill -USR1 $PID
+
+# Wait for experiments to complete
+wait $PID
+```
+
+### Progress Points from C Code
+
+Programs can explicitly mark progress points even if they're being profiled
+via LD_PRELOAD:
+
+```c
+#include <andweorc.h>
+
+void process_item(Item* item) {
+    // ... do work ...
+    andweorc_progress("item_done");  // Mark completion
+}
+```
+
+### Programmatic Triggering
+
+You can also trigger experiments from code:
+
+```c
+// After warmup period
+andweorc_trigger_experiments("request_done");
+```
+
 ## Troubleshooting
 
 ### "Operation not supported" errors

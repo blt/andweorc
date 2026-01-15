@@ -602,7 +602,7 @@ pub unsafe extern "C" fn andweorc_run_experiments(progress_point_name: *const c_
 
 /// Initializes the profiler.
 ///
-/// When using LD_PRELOAD, the profiler is initialized automatically.
+/// When using `LD_PRELOAD`, the profiler is initialized automatically.
 /// This function is provided for cases where you want to initialize
 /// the profiler directly from your code.
 ///
@@ -620,6 +620,89 @@ pub unsafe extern "C" fn andweorc_init() -> c_int {
         Ok(()) => 0,
         Err(_) => 1,
     }
+}
+
+/// Registers the SIGUSR1 signal handler for external experiment triggering.
+///
+/// After calling this function, you can trigger causal profiling experiments
+/// by sending SIGUSR1 to the process: `kill -USR1 <pid>`
+///
+/// The experiment will run at the next progress point visit and measure
+/// throughput against the progress point specified by `ANDWEORC_EXPERIMENT_TARGET`
+/// (defaults to "default").
+///
+/// # Returns
+///
+/// 0 on success, non-zero on failure.
+///
+/// # Thread Safety
+///
+/// This function is idempotent - calling it multiple times is safe.
+///
+/// # Example
+///
+/// ```c
+/// int main(void) {
+///     andweorc_init();
+///     andweorc_register_signal_trigger();  // Now `kill -USR1 <pid>` works
+///
+///     start_workers();  // Workers call andweorc_progress("item_done")
+///     sleep(60);        // Let workers run
+///     stop_workers();
+///     return 0;
+/// }
+/// ```
+#[no_mangle]
+#[allow(unreachable_pub)]
+pub unsafe extern "C" fn andweorc_register_signal_trigger() -> c_int {
+    match crate::posix::trigger::register_sigusr1_handler() {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Manually triggers causal profiling experiments.
+///
+/// This is equivalent to sending SIGUSR1 to the process but can be called
+/// directly from code. The experiment will run at the next progress point
+/// visit and measure throughput against the specified progress point.
+///
+/// # Parameters
+///
+/// * `progress_point_name` - Name of the progress point to measure throughput.
+///   If null, uses the value from `ANDWEORC_EXPERIMENT_TARGET` or "default".
+///
+/// # Thread Safety
+///
+/// This function sets a flag that will be checked at the next progress point
+/// visit. The actual experiment runs on the thread that visits the progress
+/// point.
+///
+/// # Example
+///
+/// ```c
+/// // Trigger experiments programmatically after warmup
+/// sleep(10);  // Let system warm up
+/// andweorc_trigger_experiments("items_processed");
+/// ```
+#[no_mangle]
+#[allow(unreachable_pub)]
+pub unsafe extern "C" fn andweorc_trigger_experiments(progress_point_name: *const c_char) {
+    // Set the experiment target if provided
+    if !progress_point_name.is_null() {
+        // Convert to string and call run_experiments directly
+        if let Some(name_str) = cstr_to_str_bounded(progress_point_name) {
+            libc_print::libc_println!(
+                "[andweorc] triggering experiments for progress point: {name_str}"
+            );
+            let _ = crate::run_experiments(name_str);
+            return;
+        }
+    }
+
+    // Fall back to signal-based trigger mechanism
+    // This will use ANDWEORC_EXPERIMENT_TARGET or "default"
+    crate::posix::trigger::check_and_run_experiments();
 }
 
 /// Gets the current monotonic time in nanoseconds.

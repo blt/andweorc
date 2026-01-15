@@ -3,6 +3,7 @@
 # C example binaries
 examples/c/cache_contention
 examples/c/dedup_hash
+examples/c/signal_trigger
 
 # Profiler output files
 *.coz
